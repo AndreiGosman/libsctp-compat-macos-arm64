@@ -74,8 +74,15 @@ requires root for raw sockets, so the process must run privileged.
 UDP encapsulation, RFC 6951, is selected by setting
 `LIBSCTP_COMPAT_UDP_ENCAPS_PORT` to a port number, conventionally 9899. It
 needs no privilege, and it needs a peer that also encapsulates. The library
-sets both the local and the remote encapsulation port, because usrsctp
+sets the remote encapsulation port on every socket as well, because usrsctp
 otherwise sends raw SCTP no matter what the local setting says.
+
+Two processes on one host cannot share a tunnelling port. Give each its own
+`LIBSCTP_COMPAT_UDP_ENCAPS_PORT` and point it at the other with
+`LIBSCTP_COMPAT_UDP_ENCAPS_REMOTE_PORT`, which otherwise defaults to the local
+port. The port is checked before the stack starts: `usrsctp_init` returns void
+and carries on with no transport when the bind fails, which looks like a silent
+network rather than an error, so a conflict is reported and refused instead.
 
 Set `LIBSCTP_COMPAT_DEBUG=1` for a trace of socket creation, the receive pump
 and the backend.
@@ -160,9 +167,20 @@ documented above as differences a caller can see, which is where they belong.
 
 The loopback test establishes a real SCTP association between two sockets in
 one process, sends a payload, and reads it back through `poll()` and
-`sctp_recvmsg` with the association id and peer address intact. That path
-works. A conversation with a separate host running a real SCTP stack has not
-been tested yet.
+`sctp_recvmsg` with the association id and peer address intact.
+
+A separate two process exchange has also been run over loopback, in the shape
+S1AP uses: a one-to-many listener, a client that connects and sends, an
+association notification and a payload delivered with the right association id,
+and a reply back. That works with distinct encapsulation ports.
+
+A conversation with a separate host running a kernel SCTP stack has not been
+tested yet.
+
+One behaviour to know when reading logs: `connect()` on a one-to-many socket
+returns once the INIT is queued, not once the association is up, so a
+successful return is not by itself evidence of a peer. Wait for the
+`SCTP_ASSOC_CHANGE` notification.
 
 ## License
 

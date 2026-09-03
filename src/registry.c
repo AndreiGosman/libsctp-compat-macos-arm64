@@ -31,6 +31,7 @@ static pthread_once_t    g_backend_once = PTHREAD_ONCE_INIT;
 static int               g_backend_rc = -1;
 static int               g_debug = -1;
 static uint16_t          g_encaps_port;
+static uint16_t          g_encaps_remote_port;
 
 /* ------------------------------------------------------------------ */
 /* logging                                                             */
@@ -133,15 +134,67 @@ LSC_REAL(int, shutdown, (int fd, int h), (fd, h))
 /* backend bring-up                                                    */
 /* ------------------------------------------------------------------ */
 
+static uint16_t lsc_port_env(const char *name)
+{
+	const char *v = getenv(name);
+	long        n;
+
+	if (v == NULL || *v == '\0')
+		return 0;
+	n = strtol(v, NULL, 10);
+	return (n > 0 && n < 65536) ? (uint16_t)n : 0;
+}
+
+/*
+ * usrsctp_init returns void. If it cannot bind the UDP tunnelling port,
+ * because another process on the host already holds it, it carries on with no
+ * transport at all: sends go nowhere and connect() still reports success on a
+ * one-to-many socket, because that call only queues the INIT. Check the port
+ * first so the failure is visible instead of looking like a silent network.
+ */
+static int lsc_port_is_free(uint16_t port)
+{
+	struct sockaddr_in addr;
+	int                fd, rc, on = 1;
+
+	fd = lsc_real_socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return 1; /* cannot tell; do not block the caller */
+
+	(void)lsc_real_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_len         = sizeof(addr);
+	addr.sin_family      = AF_INET;
+	addr.sin_port        = htons(port);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	rc = lsc_real_bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+	lsc_real_close(fd);
+	return rc == 0;
+}
+
 static void lsc_backend_once(void)
 {
-	const char *enc = getenv("LIBSCTP_COMPAT_UDP_ENCAPS_PORT");
-	uint16_t    port = 0;
+	uint16_t port = lsc_port_env("LIBSCTP_COMPAT_UDP_ENCAPS_PORT");
 
-	if (enc != NULL && *enc != '\0') {
-		long v = strtol(enc, NULL, 10);
-		if (v > 0 && v < 65536)
-			port = (uint16_t)v;
+	/* Two processes on one host cannot share a tunnelling port, so each
+	 * needs its own and has to be told the peer's. Default to the local
+	 * one, which is right for a single process talking to a remote host. */
+	g_encaps_remote_port = lsc_port_env("LIBSCTP_COMPAT_UDP_ENCAPS_REMOTE_PORT");
+	if (g_encaps_remote_port == 0)
+		g_encaps_remote_port = port;
+
+	if (port != 0 && !lsc_port_is_free(port)) {
+		fprintf(stderr,
+		        "[libsctp-compat] UDP encapsulation port %u is already in "
+		        "use; another process holds it. Set "
+		        "LIBSCTP_COMPAT_UDP_ENCAPS_PORT to a free port and point "
+		        "the peer at it with "
+		        "LIBSCTP_COMPAT_UDP_ENCAPS_REMOTE_PORT.\n",
+		        port);
+		g_backend_rc = -1;
+		return;
 	}
 
 	/*
@@ -156,8 +209,11 @@ static void lsc_backend_once(void)
 	 * encapsulated association to 127.0.0.1 is dropped as corrupt. */
 	usrsctp_sysctl_set_sctp_no_csum_on_loopback(0);
 	g_encaps_port = port;
-	lsc_log("usrsctp up, %s",
-	        port ? "UDP encapsulation" : "raw sockets (needs root)");
+	if (port != 0)
+		lsc_log("usrsctp up, UDP encapsulation, local port %u, peer port %u",
+		        port, g_encaps_remote_port);
+	else
+		lsc_log("usrsctp up, raw sockets (needs root)");
 	g_backend_rc = 0;
 }
 
@@ -249,7 +305,7 @@ struct lsc_conn *lsc_create(int domain, int type)
 		memset(&enc, 0, sizeof(enc));
 		enc.sue_address.ss_family = (sa_family_t)domain;
 		enc.sue_address.ss_len    = sizeof(enc.sue_address);
-		enc.sue_port              = htons(g_encaps_port);
+		enc.sue_port              = htons(g_encaps_remote_port);
 		if (usrsctp_setsockopt(c->us, IPPROTO_SCTP,
 		                       SCTP_REMOTE_UDP_ENCAPS_PORT, &enc,
 		                       sizeof(enc)) != 0)
