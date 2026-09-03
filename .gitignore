@@ -1,0 +1,6 @@
+build/
+*.o
+*.dylib
+*.pc
+!libsctp.pc.in
+.DS_Store
