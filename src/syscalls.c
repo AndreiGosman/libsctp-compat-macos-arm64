@@ -103,7 +103,15 @@ int connect(int fd, const struct sockaddr *addr, socklen_t len)
 	                    len) != 0)
 		return -1;
 
-	if (len > 0 && len <= sizeof(c->peer)) {
+	c->connects++;
+
+	if (c->connects > 1) {
+		/* Several associations on one socket. There is no single
+		 * default any more, so stop pretending there is one. */
+		c->peerlen = 0;
+		lsc_log("fd=%d has %u associations, default peer dropped",
+		        fd, c->connects);
+	} else if (len > 0 && len <= sizeof(c->peer)) {
 		memcpy(&c->peer, &ss, len);
 		c->peerlen = len;
 	}

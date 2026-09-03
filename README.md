@@ -102,14 +102,25 @@ and the backend.
 The header uses the Linux value and the shim translates it, so code that
 hardcodes `0x0b` still works.
 
-`sctp_freepaddrs(NULL)` is a no-op on Linux. `usrsctp_freepaddrs(NULL)` steps
-backwards from the pointer to reach a hidden header and calls `free()` on a
-wild address, which aborts the process. This library guards it.
+`sctp_freepaddrs(NULL)` is a no-op on Linux, where lksctp-tools implements it
+as a bare `free(addrs)`. usrsctp inherits the FreeBSD libc version, which steps
+backwards from the pointer to reach a hidden header and frees a wild address.
+Neither is wrong: NULL is simply not a documented argument. This library
+guards it so that cleanup paths written against Linux do not abort.
 
-usrsctp does not infer the association of a one-to-many socket from an earlier
-`connect()`, and returns `ENOENT` from a send with neither a destination
-address nor an association id. The library records the peer at `connect()` time
-and supplies it, which restores the Linux behaviour.
+lksctp-tools declares `sctp_freepaddrs` and `sctp_freeladdrs` as returning
+`int`; FreeBSD and usrsctp return `void`. The header here uses `int`, which
+compiles for callers written against either.
+
+A send on a one-to-many socket with neither a destination address nor an
+association id returns `ENOENT`. usrsctp is right to do so: RFC 6458 section
+3.1.3 states that `connect()` on a one-to-many socket creates an association
+but no default destination, and that repeated `connect()` calls create several
+associations on the same socket. Code written against Linux is often looser
+than the specification allows, so this library remembers the peer of a single
+`connect()` and supplies it. That convenience is withdrawn as soon as a second
+`connect()` makes the choice ambiguous, because picking between two
+associations would deliver data to the wrong peer in silence.
 
 usrsctp is built with `HAVE_SA_LEN` and `HAVE_SIN_LEN`, so it reads the
 `sin_len` field that Linux sockaddrs do not have. Every address the caller
@@ -136,6 +147,14 @@ includes the Linux-only `sys/timerfd.h`.
 
 osmo-bts and the Osmocom core network are the next targets and are not yet
 tested.
+
+## Upstream
+
+Nothing here is filed against usrsctp. The two behaviours this library works
+around are inherited FreeBSD semantics rather than defects: `sctp_freepaddrs`
+is a verbatim copy of the FreeBSD libc function, and the `ENOENT` on an
+unaddressed one-to-many send is what RFC 6458 section 3.1.3 calls for. Both are
+documented above as differences a caller can see, which is where they belong.
 
 ## Status
 

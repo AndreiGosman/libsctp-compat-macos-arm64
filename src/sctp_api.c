@@ -76,9 +76,14 @@ static ssize_t lsc_sendv(struct lsc_conn *c, const void *msg, size_t len,
 	dst = lsc_fix_sa_local(to, tolen, &ss);
 
 	/*
-	 * With neither a destination nor an association id, usrsctp cannot
-	 * resolve the target and returns ENOENT. Linux would use the
-	 * association left by connect(), so fall back to the peer we stored.
+	 * With neither a destination nor an association id, usrsctp returns
+	 * ENOENT. RFC 6458 section 3.1.3 agrees with usrsctp here: on a
+	 * one-to-many socket connect() creates an association but no default
+	 * destination. Code written against Linux is often looser than that,
+	 * so we fall back to the peer of a single connect() as a convenience.
+	 * The fallback is dropped once a second connect() makes the choice
+	 * ambiguous, because guessing between two associations would send
+	 * data to the wrong peer without saying so.
 	 */
 	if (dst == NULL && assoc_id == 0 && c->peerlen > 0) {
 		dst    = (const struct sockaddr *)&c->peer;
@@ -279,11 +284,12 @@ int sctp_getpaddrs(int sd, sctp_assoc_t id, struct sockaddr **addrs)
  * hidden header, so a NULL argument becomes a free() on a wild address.
  * lksctp treats NULL as a no-op and callers rely on that in cleanup paths.
  */
-void sctp_freepaddrs(struct sockaddr *addrs)
+int sctp_freepaddrs(struct sockaddr *addrs)
 {
 	if (addrs == NULL)
-		return;
+		return 0;
 	usrsctp_freepaddrs(addrs);
+	return 0;
 }
 
 int sctp_getladdrs(int sd, sctp_assoc_t id, struct sockaddr **addrs)
@@ -297,11 +303,12 @@ int sctp_getladdrs(int sd, sctp_assoc_t id, struct sockaddr **addrs)
 	return usrsctp_getladdrs(c->us, id, addrs);
 }
 
-void sctp_freeladdrs(struct sockaddr *addrs)
+int sctp_freeladdrs(struct sockaddr *addrs)
 {
 	if (addrs == NULL)
-		return;
+		return 0;
 	usrsctp_freeladdrs(addrs);
+	return 0;
 }
 
 int sctp_opt_info(int sd, sctp_assoc_t id, int opt, void *arg,

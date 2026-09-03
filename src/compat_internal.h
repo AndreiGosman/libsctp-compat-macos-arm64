@@ -62,6 +62,7 @@ struct lsc_conn {
 	 * so we supply the address again on every send that omits one. */
 	struct sockaddr_storage peer;
 	socklen_t               peerlen;
+	unsigned                connects;
 	pthread_mutex_t tx_lock;
 };
 

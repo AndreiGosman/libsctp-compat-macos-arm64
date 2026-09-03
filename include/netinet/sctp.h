@@ -302,9 +302,11 @@ int sctp_bindx(int sd, struct sockaddr *addrs, int addrcnt, int flags);
 int sctp_connectx(int sd, struct sockaddr *addrs, int addrcnt,
                   sctp_assoc_t *id);
 int sctp_getpaddrs(int sd, sctp_assoc_t id, struct sockaddr **addrs);
-void sctp_freepaddrs(struct sockaddr *addrs);
+/* lksctp-tools returns int from both free helpers, FreeBSD returns void.
+ * int is the safe declaration: callers that ignore it still compile. */
+int sctp_freepaddrs(struct sockaddr *addrs);
 int sctp_getladdrs(int sd, sctp_assoc_t id, struct sockaddr **addrs);
-void sctp_freeladdrs(struct sockaddr *addrs);
+int sctp_freeladdrs(struct sockaddr *addrs);
 int sctp_opt_info(int sd, sctp_assoc_t id, int opt, void *arg,
                   socklen_t *size);
 int sctp_peeloff(int sd, sctp_assoc_t id);
