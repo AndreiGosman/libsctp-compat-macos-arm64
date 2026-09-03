@@ -155,6 +155,18 @@ includes the Linux-only `sys/timerfd.h`.
 osmo-bts and the Osmocom core network are the next targets and are not yet
 tested.
 
+## Loopback aliases
+
+usrsctp does not accept traffic addressed to a loopback alias. Binding an SCTP
+socket to 127.0.1.100 succeeds and sending to it reports success, but the
+packets are never delivered, and the same holds with the receiving endpoint
+bound to INADDR_ANY. Plain UDP to the same address is delivered normally, so
+the kernel is routing it; the packet is dropped inside usrsctp.
+
+127.0.0.1 works, and so does a real interface address. Only the extra loopback
+addresses fail. Two processes on one host can therefore both use 127.0.0.1,
+which is enough as long as they do not need the same port.
+
 ## Upstream
 
 Nothing here is filed against usrsctp. The two behaviours this library works
