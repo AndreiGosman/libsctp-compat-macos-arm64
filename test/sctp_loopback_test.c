@@ -21,7 +21,9 @@
 #include <string.h>
 #include <unistd.h>
 
-#define ENCAPS_PORT "9899"
+/* Not the conventional 9899: the suite has to run while something else
+ * on the machine is using it. */
+#define ENCAPS_PORT "39899"
 #define SERVER_PORT 36412
 #define PAYLOAD     "S1AP-SETUP-REQUEST"
 
