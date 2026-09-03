@@ -63,6 +63,13 @@ if(sctp_build_tests)
   target_link_libraries(sctp_loopback_test PRIVATE sctp)
   add_test(NAME sctp_loopback_test COMMAND sctp_loopback_test)
 
+  # Two processes, which is the only way to catch port conflicts, silent
+  # backend init failures and the parts of connection setup that are
+  # asynchronous.
+  add_executable(sctp_twoproc_test test/sctp_twoproc_test.c)
+  target_link_libraries(sctp_twoproc_test PRIVATE sctp)
+  add_test(NAME sctp_twoproc_test COMMAND sctp_twoproc_test)
+
   # The header is consumed from C++ by both srsRAN and Osmocom.
   add_executable(sctp_cxx_usage_test test/sctp_cxx_usage_test.cc)
   set_target_properties(sctp_cxx_usage_test PROPERTIES CXX_STANDARD 14)

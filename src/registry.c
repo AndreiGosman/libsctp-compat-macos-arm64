@@ -429,7 +429,20 @@ int lsc_recv_cb(struct socket *sock, union sctp_sockstore addr, void *data,
 
 	hdr.sri.sinfo_stream   = rcv.rcv_sid;
 	hdr.sri.sinfo_ssn      = rcv.rcv_ssn;
-	hdr.sri.sinfo_flags    = rcv.rcv_flags;
+	/*
+	 * Do not pass rcv_flags through. usrsctp reports the DATA chunk's
+	 * fragmentation bits here, shifted into the high byte: a complete
+	 * message arrives as 0x0300, which is first-fragment and last-fragment
+	 * together. The send side reads that same byte as SCTP_EOF and
+	 * SCTP_ABORT. Callers commonly keep the received sctp_sndrcvinfo and
+	 * hand it back to sctp_send to answer on the same association, and on
+	 * Linux that is safe because those bits never appear there. Here it
+	 * would shut the association down and abort it, with the send still
+	 * reporting success, so the peer simply stops hearing anything.
+	 *
+	 * Report only what Linux reports: whether the message was unordered.
+	 */
+	hdr.sri.sinfo_flags    = (rcv.rcv_flags & SCTP_UNORDERED) ? SCTP_UNORDERED : 0;
 	hdr.sri.sinfo_ppid     = rcv.rcv_ppid;
 	hdr.sri.sinfo_context  = rcv.rcv_context;
 	hdr.sri.sinfo_tsn      = rcv.rcv_tsn;

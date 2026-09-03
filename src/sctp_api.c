@@ -76,6 +76,55 @@ static ssize_t lsc_sendv(struct lsc_conn *c, const void *msg, size_t len,
 	dst = lsc_fix_sa_local(to, tolen, &ss);
 
 	/*
+	 * An association identified only by its id is not enough to reach the
+	 * peer when UDP encapsulation is in use. usrsctp then takes the
+	 * encapsulation port from the association rather than from the socket,
+	 * and an association accepted from an incoming INIT does not carry one,
+	 * so the reply leaves as bare SCTP and is lost. The send still reports
+	 * success, which makes it look like the peer stopped answering.
+	 *
+	 * Supplying the address as well puts the send back on the path that
+	 * honours the socket's setting. The lookup costs an allocation per
+	 * send, which is acceptable on the control plane this serves; callers
+	 * that pass an address already skip it.
+	 */
+	if (dst == NULL && assoc_id != 0) {
+		struct sockaddr *paddrs = NULL;
+		int              n      = usrsctp_getpaddrs(c->us, assoc_id, &paddrs);
+
+		lsc_log("send by assoc %u: getpaddrs -> %d", assoc_id, n);
+
+		if (n > 0 && paddrs != NULL) {
+			socklen_t plen = 0;
+
+			switch (paddrs->sa_family) {
+			case AF_INET:
+				plen = sizeof(struct sockaddr_in);
+				break;
+			case AF_INET6:
+				plen = sizeof(struct sockaddr_in6);
+				break;
+			default:
+				break;
+			}
+			if (plen > 0 && plen <= sizeof(ss)) {
+				/* Normalise sa_len as for any other address:
+				 * usrsctp reads it and what getpaddrs returns
+				 * is not guaranteed to carry one. */
+				dst   = lsc_fix_sa_local(paddrs, plen, &ss);
+				tolen = plen;
+				lsc_log("send by assoc %u: peer family %d len %u",
+				        assoc_id, (int)paddrs->sa_family, (unsigned)plen);
+				/* Clear the id: given both, usrsctp resolves by
+				 * association and the address is ignored, which
+				 * is the path that loses the encapsulation port. */
+				info.snd_assoc_id = 0;
+			}
+			usrsctp_freepaddrs(paddrs);
+		}
+	}
+
+	/*
 	 * With neither a destination nor an association id, usrsctp returns
 	 * ENOENT. RFC 6458 section 3.1.3 agrees with usrsctp here: on a
 	 * one-to-many socket connect() creates an association but no default
