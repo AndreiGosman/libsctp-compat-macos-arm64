@@ -50,6 +50,7 @@ typedef uint32_t sctp_assoc_t;
 #define SCTP_INITMSG                0x00000003
 #define SCTP_NODELAY                0x00000004
 #define SCTP_AUTOCLOSE              0x00000005
+#define SCTP_SET_PEER_PRIMARY_ADDR  0x00000006
 #define SCTP_PRIMARY_ADDR           0x00000007
 #define SCTP_ADAPTATION_LAYER       0x00000008
 #define SCTP_DISABLE_FRAGMENTS      0x00000009
@@ -283,9 +284,29 @@ struct sctp_assocparams {
 	uint16_t     sasoc_number_peer_destinations;
 };
 
+/* NOTE: the member order below follows usrsctp, not lksctp. The shim hands
+ * these structures to usrsctp byte for byte, so the layout must be the one
+ * usrsctp expects. Member names stay the lksctp ones, so source written
+ * against lksctp keeps working unchanged. */
+/* SCTP_PRIMARY_ADDR. lksctp calls this sctp_prim and aliases sctp_setprim
+ * onto it; usrsctp calls it sctp_setprim. Both names are provided. */
+struct sctp_prim {
+	struct sockaddr_storage ssp_addr;
+	sctp_assoc_t            ssp_assoc_id;
+	uint8_t                 ssp_padding[4];
+};
+#define sctp_setprim sctp_prim
+
+/* SCTP_SET_PEER_PRIMARY_ADDR */
+struct sctp_setpeerprim {
+	struct sockaddr_storage sspp_addr;
+	sctp_assoc_t            sspp_assoc_id;
+	uint8_t                 sspp_padding[4];
+};
+
 struct sctp_paddrinfo {
-	sctp_assoc_t            spinfo_assoc_id;
 	struct sockaddr_storage spinfo_address;
+	sctp_assoc_t            spinfo_assoc_id;
 	int32_t                 spinfo_state;
 	uint32_t                spinfo_cwnd;
 	uint32_t                spinfo_srtt;
@@ -378,7 +399,8 @@ struct sctp_authkey_event {
 	uint16_t     auth_flags;
 	uint32_t     auth_length;
 	uint16_t     auth_keynumber;
-	uint16_t     auth_altkeynumber;
+	/* lksctp carries a deprecated auth_altkeynumber here. usrsctp does not,
+	 * and including it shifts the two members that follow. */
 	uint32_t     auth_indication;
 	sctp_assoc_t auth_assoc_id;
 };

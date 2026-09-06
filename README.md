@@ -52,11 +52,24 @@ control buffer too small for it reports `MSG_CTRUNC`, as the kernel does.
 
 `accept()` needs a readiness signal that a listening socket does not
 otherwise have. Nothing writes to its pump, because a listening socket
-carries no data, so `poll()` would wait forever. A usrsctp upcall now puts
-one token on the pump per pending association and `accept()` takes one off
-again, which is what lets a `poll()` driven server work unchanged. The
-accepted association is wrapped in a connection of its own, with a
-descriptor of its own.
+carries no data, so `poll()` would wait forever.
+
+A usrsctp upcall supplies it, and since v0.3.0 the upcall does the accepting
+as well. Everything usrsctp has ready is taken with `usrsctp_accept()`,
+wrapped in a connection of its own with a descriptor of its own, and put on a
+queue held by the listener; one token goes on the pump per queued entry.
+`accept()` then only pops that queue, so it never waits and a readable
+descriptor always has a connection behind it.
+
+Doing it the other way round does not work, and both ways of getting it wrong
+are worth recording. Asking usrsctp for readiness and calling
+`usrsctp_accept()` from `accept()` means asking `soreadable()`, which is also
+true when the listening socket carries an error. A non-blocking
+`usrsctp_accept()` answers `EWOULDBLOCK` without ever clearing that error, so
+the descriptor stays readable and a `poll()` loop spins on it. Leaving that
+accept blocking instead parks the caller on a condition variable inside its
+own event callback, which stops a single-threaded daemon completely, VTY and
+all. Both were seen against osmo-stp.
 
 `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_RCVBUF` and `SO_SNDBUF` are applied to the
 socketpair rather than the usrsctp socket, because that is the descriptor the
@@ -118,7 +131,7 @@ and the backend.
 | `sctp_recvmsg` | `recvmsg` on the socketpair, fed by the receive callback |
 | `sendmsg` with an SCTP control message | the `sctp_sendmsg` path, after gathering the iovec |
 | `recvmsg` | the socketpair, with an `SCTP_SNDRCV` control message built from the frame |
-| `accept` | `usrsctp_accept`, wrapped in a new descriptor; readiness through a listen upcall |
+| `accept` | pops a connection the listen upcall already accepted and adopted; never waits |
 | `sctp_bindx` | `usrsctp_bindx`, one address per call |
 | `sctp_connectx`, `sctp_getpaddrs`, `sctp_getladdrs`, `sctp_opt_info` | the matching `usrsctp_*` call |
 | `sctp_freepaddrs`, `sctp_freeladdrs` | the matching call, with a NULL guard |
@@ -173,6 +186,17 @@ partial reliability in a separate `sctp_prinfo` block. A non-zero value is
 logged rather than silently dropped.
 
 Messages larger than 256 KB are dropped by the pump and logged.
+
+A burst of simultaneous associations can lose a first message. Starting fifty
+clients at the same instant against one listener loses roughly one of their
+opening messages, in about two runs out of five. The loss is below this
+library: the receive callback never fires for it, nothing is misrouted, and no
+pump write fails. usrsctp sizes the receive buffer of its raw SCTP sockets but
+not of the UDP socket that carries the encapsulation, and a fifty-way
+handshake on loopback overruns it. That socket is private to usrsctp, so it
+cannot be widened from here; the fix belongs upstream. Spacing the connections
+a few milliseconds apart avoids it, and the stress test does that by default.
+Set `SCTP_STRESS_STAGGER_US=0` to reproduce the loss.
 
 ## Tested against
 
@@ -238,6 +262,22 @@ calls reach usrsctp unless they are interposed, so a shim that passes the
 `sctp_*()` tests can still fail every one of them. Running it in one process
 would hide the failures that matter, which is why all three run across two.
 
+A concurrent accept test runs fifty clients against one listener, each sending
+a message and waiting for the echo, with a worker thread per accepted
+descriptor. It checks the three things that have gone wrong here: that the
+server never parks inside `accept()`, that an idle listener with no peer
+reports nothing readable and burns no CPU, and that no reply reaches the wrong
+client. A watchdog ends the run after thirty seconds, because the first two
+failures show up as "never finishes" rather than as a wrong answer.
+
+`SCTP_GET_PEER_ADDR_INFO` and the `sstat_primary` member of `SCTP_STATUS` now
+return real data. Until v0.3.0 `struct sctp_paddrinfo` was declared in lksctp
+member order while the bytes were handed to usrsctp, which expects the address
+first, so both returned rearranged fields. `struct sctp_authkey_event` had the
+same problem, from an `auth_altkeynumber` member that lksctp has and usrsctp
+does not. Verified by comparing member offsets and sizes against usrsctp, and
+against libosmo-sigtran's `show cs7 instance 0 asp` output.
+
 A conversation with a separate host running a kernel SCTP stack has not been
 tested yet.
 
@@ -245,6 +285,31 @@ One behaviour to know when reading logs: `connect()` on a one-to-many socket
 returns once the INIT is queued, not once the association is up, so a
 successful return is not by itself evidence of a peer. Wait for the
 `SCTP_ASSOC_CHANGE` notification.
+
+## Rebuilding consumers after the shim gains a symbol
+
+macOS uses a two-level namespace: the library that supplies each undefined
+symbol is recorded at link time, not resolved at load time. A consumer linked
+against a shim that did not yet export `accept` keeps that call bound to
+libSystem for the life of the binary, even after this library grows the
+symbol. Nothing warns about it. `socket()` still routes here and returns a
+descriptor backed by a socketpair, and the real `accept()` is then called on
+that socketpair and fails with `EOPNOTSUPP` forever.
+
+That is not hypothetical: libosmo-netif was built against v0.1.0, and its
+`_accept` stayed bound to libSystem while `_socket` and `_setsockopt` pointed
+here. The Osmocom server on top of it turned the failure into a hot loop.
+
+After upgrading to a version that adds interposed calls, rebuild every
+consumer that links this library and check what the bindings became:
+
+```bash
+nm -mu $HOME/sdr-lab/local/lib/libosmonetif.dylib | \
+    grep -E "_accept|_sendmsg|_recvmsg|_socket"
+```
+
+Every line should say `(from libsctp)`. A line saying `(from libSystem)` is a
+consumer that still needs relinking.
 
 ## License
 

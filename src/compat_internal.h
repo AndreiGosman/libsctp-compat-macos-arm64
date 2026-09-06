@@ -63,9 +63,23 @@ struct lsc_conn {
 	struct sockaddr_storage peer;
 	socklen_t               peerlen;
 	unsigned                connects;
-	/* Set by listen(). A listening socket never receives data, so its
-	 * pump carries one readiness token per pending association instead. */
-	int             listening;
+	/*
+	 * Set by listen(). A listening socket never receives data, so its
+	 * pump carries one readiness token per pending association instead.
+	 *
+	 * The associations are taken off usrsctp inside the upcall, adopted,
+	 * and queued below. One token is written per queued entry, so a
+	 * readable descriptor always means there is a connection waiting.
+	 * Asking usrsctp for readiness instead does not work: soreadable() on
+	 * a listening socket is also true when so_error is set, and a
+	 * non-blocking usrsctp_accept() returns EWOULDBLOCK without ever
+	 * clearing that error, which latches the descriptor readable for good.
+	 */
+	int              listening;
+	struct lsc_conn *acc_head;   /* oldest queued association */
+	struct lsc_conn *acc_tail;
+	struct lsc_conn *acc_next;   /* link while queued on a listener */
+	pthread_mutex_t  acc_lock;   /* guards acc_head/acc_tail of a listener */
 	pthread_mutex_t tx_lock;
 };
 
@@ -73,6 +87,9 @@ struct lsc_conn {
  * a flat array under a read-mostly lock. */
 void            lsc_registry_init(void);
 struct lsc_conn *lsc_lookup(int fd);
+/* Resolve by usrsctp socket. The receive callback needs this because an
+ * accepted socket carries the listener's ulp_info until adoption sets it. */
+struct lsc_conn *lsc_lookup_sock(struct socket *us);
 struct lsc_conn *lsc_create(int domain, int type);
 /* Wrap a usrsctp socket we did not create, as accept() returns. */
 struct lsc_conn *lsc_adopt(int domain, int type, struct socket *us);
@@ -80,6 +97,12 @@ void            lsc_destroy(struct lsc_conn *c);
 
 /* Arms the readiness pump on a listening socket. */
 int lsc_listen_arm(struct lsc_conn *c);
+
+/* Takes the oldest association off a listener's queue, NULL when empty. */
+struct lsc_conn *lsc_accept_pop(struct lsc_conn *listener);
+
+/* Drops and destroys every association still queued on a listener. */
+void lsc_accept_drain(struct lsc_conn *listener);
 
 /* Lazy one-time usrsctp_init. Returns 0 on success, -1 with errno set. */
 int lsc_backend_init(void);

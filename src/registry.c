@@ -290,6 +290,7 @@ static struct lsc_conn *lsc_alloc(int domain, int type)
 	c->domain  = domain;
 	c->type    = type;
 	pthread_mutex_init(&c->tx_lock, NULL);
+	pthread_mutex_init(&c->acc_lock, NULL);
 	return c;
 }
 
@@ -298,7 +299,30 @@ static void lsc_free(struct lsc_conn *c)
 	lsc_real_close(c->app_fd);
 	lsc_real_close(c->pump_fd);
 	pthread_mutex_destroy(&c->tx_lock);
+	pthread_mutex_destroy(&c->acc_lock);
 	free(c);
+}
+
+/* Defined below, next to the receive callback it shares its framing with. */
+static void lsc_catch_up(struct lsc_conn *c);
+
+struct lsc_conn *lsc_lookup_sock(struct socket *us)
+{
+	struct lsc_conn *c = NULL;
+	int              i;
+
+	if (us == NULL)
+		return NULL;
+
+	pthread_rwlock_rdlock(&g_lock);
+	for (i = 0; i < LSC_MAX_CONNS; i++) {
+		if (g_conns[i] != NULL && g_conns[i]->us == us) {
+			c = g_conns[i];
+			break;
+		}
+	}
+	pthread_rwlock_unlock(&g_lock);
+	return c;
 }
 
 /* Publish a fully built connection. Returns 0, or -1 with the table full. */
@@ -320,6 +344,21 @@ static int lsc_publish(struct lsc_conn *c)
 		return -1;
 	}
 	return 0;
+}
+
+/* Remove a connection from the table without touching its usrsctp socket. */
+static void lsc_unpublish(struct lsc_conn *c)
+{
+	int i;
+
+	pthread_rwlock_wrlock(&g_lock);
+	for (i = 0; i < LSC_MAX_CONNS; i++) {
+		if (g_conns[i] == c) {
+			g_conns[i] = NULL;
+			break;
+		}
+	}
+	pthread_rwlock_unlock(&g_lock);
 }
 
 /*
@@ -386,14 +425,23 @@ struct lsc_conn *lsc_adopt(int domain, int type, struct socket *us)
 	c->us = us;
 
 	/*
-	 * An accepted socket inherits the listener's receive callback, and
-	 * with it the listener's ulp_info. Point it at this connection, or
-	 * every message on the new association would be pumped into the
-	 * listening socket's descriptor.
+	 * Publish before touching ulp_info. An accepted socket inherits the
+	 * listener's receive callback and the listener's ulp_info, so until
+	 * that is repointed a message on the new association would be framed
+	 * onto the listener's descriptor and lost. The receive callback
+	 * resolves the connection by socket for exactly that reason, and it
+	 * can only do so once the connection is in the table. Registering
+	 * first therefore closes the window rather than widening it.
 	 */
+	if (lsc_publish(c) != 0) {
+		lsc_free(c);
+		return NULL;
+	}
+
 	/* register_ulp_info reports success as 1, not 0. It is the odd one
 	 * out: usrsctp_set_upcall and the rest use the POSIX convention. */
 	if (usrsctp_set_ulpinfo(us, c) != 1) {
+		lsc_unpublish(c);
 		lsc_free(c);
 		errno = EINVAL;
 		return NULL;
@@ -401,32 +449,20 @@ struct lsc_conn *lsc_adopt(int domain, int type, struct socket *us)
 
 	lsc_set_encaps(c);
 
-	if (lsc_publish(c) != 0) {
-		lsc_free(c);
-		return NULL;
-	}
+	/* Anything the peer sent before we got here is already queued on the
+	 * socket and will not be announced again. Take it now. */
+	lsc_catch_up(c);
 
 	lsc_log("adopt type=%d app_fd=%d us=%p", type, c->app_fd, (void *)us);
 	return c;
 }
 
-/*
- * A listening socket produces no data, so nothing ever writes to its pump
- * and poll() on the application descriptor would never fire. Ask usrsctp to
- * tell us when an association is pending, and put one readiness token on
- * the pump for each. accept() takes one token off again.
- */
-static void lsc_listen_upcall(struct socket *so, void *arg, int flags)
+/* One readiness token on a listener's pump. */
+static int lsc_pump_token(struct lsc_conn *c)
 {
-	struct lsc_conn *c = arg;
-	unsigned char    token = 0;
-	struct iovec     iov;
-	struct msghdr    msg;
-
-	(void)flags;
-
-	if (c == NULL || !(usrsctp_get_events(so) & SCTP_EVENT_READ))
-		return;
+	unsigned char token = 0;
+	struct iovec  iov;
+	struct msghdr msg;
 
 	iov.iov_base = &token;
 	iov.iov_len  = sizeof(token);
@@ -434,13 +470,114 @@ static void lsc_listen_upcall(struct socket *so, void *arg, int flags)
 	msg.msg_iov    = &iov;
 	msg.msg_iovlen = 1;
 
-	if (lsc_real_sendmsg(c->pump_fd, &msg, 0) < 0)
-		lsc_log("listen pump write failed on app_fd=%d: %s",
-		        c->app_fd, strerror(errno));
+	return (int)lsc_real_sendmsg(c->pump_fd, &msg, 0);
+}
+
+/* Append an adopted association to a listener's queue. */
+static void lsc_accept_push(struct lsc_conn *l, struct lsc_conn *nc)
+{
+	pthread_mutex_lock(&l->acc_lock);
+	nc->acc_next = NULL;
+	if (l->acc_tail != NULL)
+		l->acc_tail->acc_next = nc;
+	else
+		l->acc_head = nc;
+	l->acc_tail = nc;
+	pthread_mutex_unlock(&l->acc_lock);
+}
+
+struct lsc_conn *lsc_accept_pop(struct lsc_conn *l)
+{
+	struct lsc_conn *nc;
+
+	pthread_mutex_lock(&l->acc_lock);
+	nc = l->acc_head;
+	if (nc != NULL) {
+		l->acc_head = nc->acc_next;
+		if (l->acc_head == NULL)
+			l->acc_tail = NULL;
+		nc->acc_next = NULL;
+	}
+	pthread_mutex_unlock(&l->acc_lock);
+	return nc;
+}
+
+void lsc_accept_drain(struct lsc_conn *l)
+{
+	struct lsc_conn *nc;
+
+	while ((nc = lsc_accept_pop(l)) != NULL) {
+		lsc_log("dropping unaccepted association app_fd=%d", nc->app_fd);
+		lsc_destroy(nc);
+	}
+}
+
+/*
+ * A listening socket produces no data, so nothing ever writes to its pump
+ * and poll() on the application descriptor would never fire.
+ *
+ * Asking usrsctp whether the socket is readable is not good enough.
+ * soreadable() is also true when so_error is set, and a non-blocking
+ * usrsctp_accept() answers EWOULDBLOCK without ever clearing that error, so
+ * the descriptor would stay readable and a poll driven caller would spin.
+ *
+ * Take the associations here instead. Everything usrsctp has ready is
+ * accepted, adopted and queued, and exactly one token goes on the pump per
+ * queued entry. A readable descriptor then always means accept() has
+ * something to return.
+ */
+static void lsc_listen_upcall(struct socket *so, void *arg, int flags)
+{
+	struct lsc_conn *c = arg;
+
+	(void)flags;
+	(void)so;
+
+	if (c == NULL || c->closing)
+		return;
+
+	for (;;) {
+		struct sockaddr_storage ss;
+		socklen_t               alen = sizeof(ss);
+		struct socket          *ns;
+		struct lsc_conn        *nc;
+
+		memset(&ss, 0, sizeof(ss));
+		ns = usrsctp_accept(c->us, (struct sockaddr *)&ss, &alen);
+		if (ns == NULL)
+			break; /* EWOULDBLOCK, or nothing left to take */
+
+		nc = lsc_adopt(c->domain, c->type, ns);
+		if (nc == NULL) {
+			lsc_log("cannot adopt an accepted association: %s",
+			        strerror(errno));
+			usrsctp_close(ns);
+			continue;
+		}
+
+		/* Remember the peer so accept() can hand it back. */
+		if (alen > 0 && alen <= sizeof(nc->peer)) {
+			memcpy(&nc->peer, &ss, alen);
+			nc->peerlen = alen;
+		}
+
+		lsc_accept_push(c, nc);
+
+		if (lsc_pump_token(c) < 0)
+			lsc_log("listen pump write failed on app_fd=%d: %s",
+			        c->app_fd, strerror(errno));
+	}
 }
 
 int lsc_listen_arm(struct lsc_conn *c)
 {
+	/*
+	 * usrsctp_accept() waits on a condition variable when the queue is
+	 * empty. The upcall runs on a usrsctp thread, so a wait there would
+	 * stall the stack itself. Non-blocking turns it into EWOULDBLOCK,
+	 * which is how the loop above knows it is done.
+	 */
+	usrsctp_set_non_blocking(c->us, 1);
 	c->listening = 1;
 	return usrsctp_set_upcall(c->us, lsc_listen_upcall, c);
 }
@@ -464,6 +601,12 @@ void lsc_destroy(struct lsc_conn *c)
 
 	lsc_log("close app_fd=%d", c->app_fd);
 
+	/* Associations that arrived but were never accepted still own a
+	 * usrsctp socket and a socketpair. Closing the listener has to take
+	 * them with it. */
+	if (c->listening)
+		lsc_accept_drain(c);
+
 	if (c->us != NULL)
 		usrsctp_close(c->us);
 	if (c->pump_fd >= 0)
@@ -483,61 +626,39 @@ void lsc_registry_init(void)
 /* the pump                                                            */
 /* ------------------------------------------------------------------ */
 
-int lsc_recv_cb(struct socket *sock, union sctp_sockstore addr, void *data,
-                size_t datalen, struct sctp_rcvinfo rcv, int flags,
-                void *ulp_info)
+/*
+ * Frame one received message onto a connection's pump. Shared by the usrsctp
+ * receive callback and by the catch-up read that adoption performs.
+ */
+static void lsc_pump_frame(struct lsc_conn *c, const void *data, size_t datalen,
+                           const struct sockaddr_storage *from, socklen_t fromlen,
+                           const struct sctp_rcvinfo *rcv, int flags)
 {
-	struct lsc_conn *c = (struct lsc_conn *)ulp_info;
 	struct lsc_frame hdr;
 	struct iovec     iov[2];
 	struct msghdr    msg;
-
-	(void)sock;
-
-	lsc_log("recv_cb conn=%p datalen=%zu flags=0x%x assoc=%u",
-	        (void *)c, datalen, flags, rcv.rcv_assoc_id);
-
-	if (c == NULL) {
-		free(data);
-		return 1;
-	}
 
 	memset(&hdr, 0, sizeof(hdr));
 	hdr.magic       = LSC_FRAME_MAGIC;
 	hdr.flags       = flags;
 	hdr.payload_len = 0;
 
-	/*
-	 * usrsctp signals end of stream with a NULL buffer. Forward it as a
-	 * zero-length datagram so that the caller's read returns 0, the same
-	 * shape a Linux SCTP socket gives on shutdown.
-	 */
 	if (data != NULL && datalen > 0) {
 		if (datalen > LSC_MAX_MSG) {
 			lsc_log("dropping %zu byte message, over %d limit",
 			        datalen, LSC_MAX_MSG);
-			free(data);
-			return 1;
+			return;
 		}
 		hdr.payload_len = (uint32_t)datalen;
 	}
 
-	switch (addr.sa.sa_family) {
-	case AF_INET:
-		memcpy(&hdr.from, &addr.sin, sizeof(addr.sin));
-		hdr.fromlen = sizeof(addr.sin);
-		break;
-	case AF_INET6:
-		memcpy(&hdr.from, &addr.sin6, sizeof(addr.sin6));
-		hdr.fromlen = sizeof(addr.sin6);
-		break;
-	default:
-		hdr.fromlen = 0;
-		break;
+	if (from != NULL && fromlen > 0 && fromlen <= sizeof(hdr.from)) {
+		memcpy(&hdr.from, from, fromlen);
+		hdr.fromlen = fromlen;
 	}
 
-	hdr.sri.sinfo_stream   = rcv.rcv_sid;
-	hdr.sri.sinfo_ssn      = rcv.rcv_ssn;
+	hdr.sri.sinfo_stream   = rcv->rcv_sid;
+	hdr.sri.sinfo_ssn      = rcv->rcv_ssn;
 	/*
 	 * Do not pass rcv_flags through. usrsctp reports the DATA chunk's
 	 * fragmentation bits here, shifted into the high byte: a complete
@@ -551,16 +672,16 @@ int lsc_recv_cb(struct socket *sock, union sctp_sockstore addr, void *data,
 	 *
 	 * Report only what Linux reports: whether the message was unordered.
 	 */
-	hdr.sri.sinfo_flags    = (rcv.rcv_flags & SCTP_UNORDERED) ? SCTP_UNORDERED : 0;
-	hdr.sri.sinfo_ppid     = rcv.rcv_ppid;
-	hdr.sri.sinfo_context  = rcv.rcv_context;
-	hdr.sri.sinfo_tsn      = rcv.rcv_tsn;
-	hdr.sri.sinfo_cumtsn   = rcv.rcv_cumtsn;
-	hdr.sri.sinfo_assoc_id = rcv.rcv_assoc_id;
+	hdr.sri.sinfo_flags    = (rcv->rcv_flags & SCTP_UNORDERED) ? SCTP_UNORDERED : 0;
+	hdr.sri.sinfo_ppid     = rcv->rcv_ppid;
+	hdr.sri.sinfo_context  = rcv->rcv_context;
+	hdr.sri.sinfo_tsn      = rcv->rcv_tsn;
+	hdr.sri.sinfo_cumtsn   = rcv->rcv_cumtsn;
+	hdr.sri.sinfo_assoc_id = rcv->rcv_assoc_id;
 
 	iov[0].iov_base = &hdr;
 	iov[0].iov_len  = sizeof(hdr);
-	iov[1].iov_base = data;
+	iov[1].iov_base = (void *)data;
 	iov[1].iov_len  = hdr.payload_len;
 
 	memset(&msg, 0, sizeof(msg));
@@ -572,6 +693,97 @@ int lsc_recv_cb(struct socket *sock, union sctp_sockstore addr, void *data,
 	if (lsc_real_sendmsg(c->pump_fd, &msg, 0) < 0)
 		lsc_log("pump write failed on app_fd=%d: %s",
 		        c->app_fd, strerror(errno));
+}
+
+/*
+ * Read whatever usrsctp already holds for a freshly adopted socket.
+ *
+ * The receive callback fires once, when a message is queued. A peer that
+ * sends immediately after connect() can have its data queued on the accepted
+ * socket before this library ever sees the association: the callback for it
+ * has already been and gone, and nothing fires again. Without this read the
+ * message sits in the socket buffer for good and the peer waits forever for
+ * an answer. It is one message in tens under load, which is exactly the kind
+ * of loss that looks like a network problem.
+ */
+static void lsc_catch_up(struct lsc_conn *c)
+{
+	char *buf = malloc(LSC_MAX_MSG);
+
+	if (buf == NULL)
+		return;
+
+	for (;;) {
+		struct sockaddr_storage from;
+		struct sctp_rcvinfo     rcv;
+		socklen_t               fromlen  = sizeof(from);
+		socklen_t               infolen  = sizeof(rcv);
+		unsigned int            infotype = 0;
+		int                     msg_flags = 0;
+		ssize_t                 n;
+
+		memset(&from, 0, sizeof(from));
+		memset(&rcv, 0, sizeof(rcv));
+
+		n = usrsctp_recvv(c->us, buf, LSC_MAX_MSG,
+		                  (struct sockaddr *)&from, &fromlen,
+		                  &rcv, &infolen, &infotype, &msg_flags);
+		if (n <= 0)
+			break;
+
+		if (infotype != SCTP_RECVV_RCVINFO)
+			memset(&rcv, 0, sizeof(rcv));
+
+		lsc_log("catch-up: %zd bytes already queued on app_fd=%d", n,
+		        c->app_fd);
+		lsc_pump_frame(c, buf, (size_t)n, &from, fromlen, &rcv, msg_flags);
+	}
+
+	free(buf);
+}
+
+int lsc_recv_cb(struct socket *sock, union sctp_sockstore addr, void *data,
+                size_t datalen, struct sctp_rcvinfo rcv, int flags,
+                void *ulp_info)
+{
+	struct lsc_conn        *c = (struct lsc_conn *)ulp_info;
+	struct sockaddr_storage from;
+	socklen_t               fromlen = 0;
+
+	/*
+	 * An accepted socket keeps the listener's ulp_info until adoption
+	 * repoints it, and a message can arrive inside that window. Framing it
+	 * onto the listener's descriptor would lose the payload and hand the
+	 * listener a readiness report with no connection behind it, so resolve
+	 * by socket whenever ulp_info names a different one.
+	 */
+	if (c == NULL || c->us != sock) {
+		struct lsc_conn *real = lsc_lookup_sock(sock);
+
+		if (real != NULL)
+			c = real;
+	}
+
+	if (c == NULL) {
+		free(data);
+		return 1;
+	}
+
+	memset(&from, 0, sizeof(from));
+	switch (addr.sa.sa_family) {
+	case AF_INET:
+		memcpy(&from, &addr.sin, sizeof(addr.sin));
+		fromlen = sizeof(addr.sin);
+		break;
+	case AF_INET6:
+		memcpy(&from, &addr.sin6, sizeof(addr.sin6));
+		fromlen = sizeof(addr.sin6);
+		break;
+	default:
+		break;
+	}
+
+	lsc_pump_frame(c, data, datalen, &from, fromlen, &rcv, flags);
 
 	free(data);
 	return 1;

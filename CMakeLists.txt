@@ -75,6 +75,17 @@ if(sctp_build_tests)
   target_link_libraries(sctp_interpose_test PRIVATE sctp)
   add_test(NAME sctp_interpose_test COMMAND sctp_interpose_test)
 
+  # Fifty clients at once, through accept(). Catches the two failures that
+  # look like "never finishes" rather than a wrong answer: a blocking accept
+  # inside the poll callback, and a descriptor that stays readable with
+  # nothing queued behind it.
+  add_executable(sctp_stress_accept_test test/sctp_stress_accept_test.c)
+  target_link_libraries(sctp_stress_accept_test PRIVATE sctp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(sctp_stress_accept_test PRIVATE Threads::Threads)
+  add_test(NAME sctp_stress_accept_test COMMAND sctp_stress_accept_test)
+  set_tests_properties(sctp_stress_accept_test PROPERTIES TIMEOUT 60)
+
   add_executable(sctp_cxx_usage_test test/sctp_cxx_usage_test.cc)
   set_target_properties(sctp_cxx_usage_test PROPERTIES CXX_STANDARD 14)
   target_link_libraries(sctp_cxx_usage_test PRIVATE sctp)

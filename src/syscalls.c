@@ -104,12 +104,9 @@ int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 {
 	struct lsc_conn *c = lsc_lookup(fd);
 	struct lsc_conn *nc;
-	struct socket   *ns;
 	unsigned char    token;
 	struct iovec     iov;
 	struct msghdr    mh;
-	socklen_t        alen;
-	struct sockaddr_storage ss;
 
 	if (c == NULL)
 		return lsc_real_accept(fd, addr, addrlen);
@@ -119,20 +116,18 @@ int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 		return -1;
 	}
 
-	alen = sizeof(ss);
-	memset(&ss, 0, sizeof(ss));
-	ns = usrsctp_accept(c->us, (struct sockaddr *)&ss, &alen);
-	if (ns == NULL) {
-		lsc_log("usrsctp_accept on fd=%d failed: %s (events=0x%x)", fd,
-		        strerror(errno), usrsctp_get_events(c->us));
+	/*
+	 * The association was already taken off usrsctp and adopted by the
+	 * upcall, so there is nothing to wait for here. Take one entry and
+	 * one token, keeping the two in step: a descriptor that still reads
+	 * as readable means another connection is queued behind this one.
+	 */
+	nc = lsc_accept_pop(c);
+	if (nc == NULL) {
+		errno = EAGAIN;
 		return -1;
 	}
 
-	/*
-	 * Take one readiness token off the pump for the association we just
-	 * accepted. Do it after the accept succeeds, so a failed accept
-	 * leaves the descriptor readable and the caller comes back.
-	 */
 	iov.iov_base = &token;
 	iov.iov_len  = sizeof(token);
 	memset(&mh, 0, sizeof(mh));
@@ -140,18 +135,10 @@ int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 	mh.msg_iovlen = 1;
 	(void)lsc_real_recvmsg(c->app_fd, &mh, MSG_DONTWAIT);
 
-	nc = lsc_adopt(c->domain, c->type, ns);
-	if (nc == NULL) {
-		int saved = errno;
-		usrsctp_close(ns);
-		errno = saved;
-		return -1;
-	}
-
-	if (addr != NULL && addrlen != NULL) {
-		socklen_t want = alen < *addrlen ? alen : *addrlen;
-		memcpy(addr, &ss, want);
-		*addrlen = alen;
+	if (addr != NULL && addrlen != NULL && nc->peerlen > 0) {
+		socklen_t want = nc->peerlen < *addrlen ? nc->peerlen : *addrlen;
+		memcpy(addr, &nc->peer, want);
+		*addrlen = nc->peerlen;
 	}
 
 	return nc->app_fd;
@@ -238,6 +225,17 @@ int setsockopt(int fd, int level, int name, const void *val, socklen_t len)
 		case SO_SNDTIMEO:
 		case SO_RCVBUF:
 		case SO_SNDBUF:
+		/*
+		 * usrsctp_setsockopt() rejects SOL_SOCKET with EINVAL, and an
+		 * SCTP server in libosmocore sets SO_REUSEADDR before it binds,
+		 * so forwarding these keeps that path working. usrsctp owns the
+		 * UDP encapsulation socket underneath, so the option cannot
+		 * reach the descriptor that actually carries the association.
+		 * The call therefore succeeds without giving the Linux TIME_WAIT
+		 * rebinding semantics.
+		 */
+		case SO_REUSEADDR:
+		case SO_REUSEPORT:
 			return lsc_real_setsockopt(fd, level, name, val, len);
 		default:
 			break;
