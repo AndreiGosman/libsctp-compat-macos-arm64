@@ -32,13 +32,31 @@ semantics survive with them, and `poll()` works because the descriptor is a
 real kernel object.
 
 The socket calls that carry SCTP are interposed. `socket()`, `bind()`,
-`listen()`, `connect()`, `close()`, `setsockopt()`, `getsockopt()`,
-`getsockname()`, `getpeername()` and `shutdown()` are exported by this library,
-so the link editor binds an application to them instead of libSystem. Each one
-checks whether the descriptor belongs to us and hands everything else straight
-back to libc. UDP and TCP in the same process are untouched. No
-`DYLD_INSERT_LIBRARIES` is needed, and none should be used: the two-level
-namespace is what keeps usrsctp's own socket calls from recursing into us.
+`listen()`, `connect()`, `accept()`, `close()`, `setsockopt()`,
+`getsockopt()`, `getsockname()`, `getpeername()`, `shutdown()`, `sendmsg()`
+and `recvmsg()` are exported by this library, so the link editor binds an
+application to them instead of libSystem. Each one checks whether the
+descriptor belongs to us and hands everything else straight back to libc. UDP
+and TCP in the same process are untouched. No `DYLD_INSERT_LIBRARIES` is
+needed, and none should be used: the two-level namespace is what keeps
+usrsctp's own socket calls from recursing into us.
+
+`sendmsg()` and `recvmsg()` matter because not every caller uses the
+`sctp_*()` helpers. A layer such as Osmocom's `osmo_io` drives its sockets
+through the raw calls and carries the SCTP parameters in a control message
+instead of in arguments. On the send side the iovec is gathered and
+`SCTP_SNDRCV` or `SCTP_SNDINFO` is read out of the control message; on the
+receive side the sender information is handed back as an `SCTP_SNDRCV`
+control message, which is where a caller written for lksctp looks for it. A
+control buffer too small for it reports `MSG_CTRUNC`, as the kernel does.
+
+`accept()` needs a readiness signal that a listening socket does not
+otherwise have. Nothing writes to its pump, because a listening socket
+carries no data, so `poll()` would wait forever. A usrsctp upcall now puts
+one token on the pump per pending association and `accept()` takes one off
+again, which is what lets a `poll()` driven server work unchanged. The
+accepted association is wrapped in a connection of its own, with a
+descriptor of its own.
 
 `SO_RCVTIMEO`, `SO_SNDTIMEO`, `SO_RCVBUF` and `SO_SNDBUF` are applied to the
 socketpair rather than the usrsctp socket, because that is the descriptor the
@@ -98,6 +116,9 @@ and the backend.
 | `getsockname`, `getpeername` | first entry of `usrsctp_getladdrs`, `_getpaddrs` |
 | `sctp_sendmsg`, `sctp_send` | `usrsctp_sendv` with `SCTP_SENDV_SNDINFO` |
 | `sctp_recvmsg` | `recvmsg` on the socketpair, fed by the receive callback |
+| `sendmsg` with an SCTP control message | the `sctp_sendmsg` path, after gathering the iovec |
+| `recvmsg` | the socketpair, with an `SCTP_SNDRCV` control message built from the frame |
+| `accept` | `usrsctp_accept`, wrapped in a new descriptor; readiness through a listen upcall |
 | `sctp_bindx` | `usrsctp_bindx`, one address per call |
 | `sctp_connectx`, `sctp_getpaddrs`, `sctp_getladdrs`, `sctp_opt_info` | the matching `usrsctp_*` call |
 | `sctp_freepaddrs`, `sctp_freeladdrs` | the matching call, with a NULL guard |
@@ -129,6 +150,16 @@ than the specification allows, so this library remembers the peer of a single
 `connect()` makes the choice ambiguous, because picking between two
 associations would deliver data to the wrong peer in silence.
 
+The notification and state constants take usrsctp's values, not Linux's. The
+two stacks disagree: `sctp_assoc_change.sac_state` starts at 1 in usrsctp and
+at 0 in the Linux kernel headers, so `SCTP_COMM_UP` is 1 here. The values
+arrive from usrsctp at runtime, so these are the numbers that describe them.
+Code that compares against the names is correct; code that hardcodes the
+Linux numbers reads every notification wrongly. A few members of those enums
+(`SCTP_PF`, `SCTP_UNKNOWN`, `SCTP_EMPTY` and the whole `sctp_sn_error` set)
+exist so that code enumerating the full lksctp set still compiles. usrsctp
+never reports them.
+
 usrsctp is built with `HAVE_SA_LEN` and `HAVE_SIN_LEN`, so it reads the
 `sin_len` field that Linux sockaddrs do not have. Every address the caller
 passes is normalised before it reaches the backend.
@@ -151,6 +182,19 @@ against the header unchanged. Building srsRAN itself on Darwin needs further
 work that has nothing to do with SCTP: srsRAN passes `-mfloat-abi=hard
 -mfpu=neon`, which Apple clang rejects on arm64, and `srsran/common/threads.h`
 includes the Linux-only `sys/timerfd.h`.
+
+libosmocore 1.14.2 builds against this library with `--enable-libsctp`, which
+is what exports `osmo_sock_init2_multiaddr` and the rest of the multiaddress
+socket API. Without it every Osmocom component above libosmocore silently
+loses SCTP support.
+
+libosmo-netif 1.8.0 builds and links against it, and its test suite passes
+except for `stream_test`. That failure is unrelated to SCTP: the test is TCP
+throughout, and its recorded output encodes two Linux behaviours that Darwin
+does not share. See the macOS ARM64 port of libosmo-netif for the detail.
+
+libosmo-abis 2.2.0 builds with no patches at all and passes all 45 of its
+tests.
 
 osmo-bts and the Osmocom core network are the next targets and are not yet
 tested.
@@ -186,6 +230,14 @@ S1AP uses: a one-to-many listener, a client that connects and sends, an
 association notification and a payload delivered with the right association id,
 and a reply back. That works with distinct encapsulation ports.
 
+A third two process exchange covers the raw socket path end to end: a
+one-to-one listener, `poll()` on the listening descriptor, `accept()`, then a
+request and a reply carried by `sendmsg()` and `recvmsg()` with the payload
+in an iovec and the PPID in an `SCTP_SNDRCV` control message. None of those
+calls reach usrsctp unless they are interposed, so a shim that passes the
+`sctp_*()` tests can still fail every one of them. Running it in one process
+would hide the failures that matter, which is why all three run across two.
+
 A conversation with a separate host running a kernel SCTP stack has not been
 tested yet.
 
@@ -196,4 +248,9 @@ successful return is not by itself evidence of a peer. Wait for the
 
 ## License
 
-LGPL-2.1-or-later. usrsctp itself is BSD-2-Clause.
+LGPL-2.1-or-later. usrsctp itself is BSD-3-Clause.
+
+## Credits
+
+Port by Andrei Gosman, developed with Claude Code CLI (Anthropic) assisting
+on pattern analysis, debugging and iteration.
