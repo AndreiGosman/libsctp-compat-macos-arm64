@@ -118,6 +118,9 @@ int getsockopt(int, int, int, void *, socklen_t *);
 int getsockname(int, struct sockaddr *, socklen_t *);
 int getpeername(int, struct sockaddr *, socklen_t *);
 int shutdown(int, int);
+ssize_t sendmsg(int, const struct msghdr *, int);
+ssize_t recvmsg(int, struct msghdr *, int);
+int accept(int, struct sockaddr *, socklen_t *);
 
 LSC_REAL(int, socket, (int d, int t, int p), (d, t, p))
 LSC_REAL(int, close, (int fd), (fd))
@@ -129,6 +132,9 @@ LSC_REAL(int, getsockopt, (int fd, int lv, int n, void *v, socklen_t *l), (fd, l
 LSC_REAL(int, getsockname, (int fd, struct sockaddr *a, socklen_t *l), (fd, a, l))
 LSC_REAL(int, getpeername, (int fd, struct sockaddr *a, socklen_t *l), (fd, a, l))
 LSC_REAL(int, shutdown, (int fd, int h), (fd, h))
+LSC_REAL(ssize_t, sendmsg, (int fd, const struct msghdr *m, int f), (fd, m, f))
+LSC_REAL(ssize_t, recvmsg, (int fd, struct msghdr *m, int f), (fd, m, f))
+LSC_REAL(int, accept, (int fd, struct sockaddr *a, socklen_t *l), (fd, a, l))
 
 /* ------------------------------------------------------------------ */
 /* backend bring-up                                                    */
@@ -248,15 +254,17 @@ struct lsc_conn *lsc_lookup(int fd)
 	return c;
 }
 
-struct lsc_conn *lsc_create(int domain, int type)
+/*
+ * Everything a connection needs except the usrsctp socket: the socketpair
+ * that gives the application a pollable descriptor, and a slot in the
+ * table. socket() then creates a usrsctp socket, accept() adopts one that
+ * usrsctp has already made for us.
+ */
+static struct lsc_conn *lsc_alloc(int domain, int type)
 {
 	struct lsc_conn *c;
 	int              sv[2];
 	int              bufsz = LSC_MAX_MSG;
-	int              slot;
-
-	if (lsc_backend_init() != 0)
-		return NULL;
 
 	c = calloc(1, sizeof(*c));
 	if (c == NULL) {
@@ -282,36 +290,21 @@ struct lsc_conn *lsc_create(int domain, int type)
 	c->domain  = domain;
 	c->type    = type;
 	pthread_mutex_init(&c->tx_lock, NULL);
+	return c;
+}
 
-	c->us = usrsctp_socket(domain, type, IPPROTO_SCTP, lsc_recv_cb, NULL, 0, c);
-	if (c->us == NULL) {
-		int saved = errno;
-		lsc_real_close(sv[0]);
-		lsc_real_close(sv[1]);
-		pthread_mutex_destroy(&c->tx_lock);
-		free(c);
-		errno = saved ? saved : EPROTONOSUPPORT;
-		return NULL;
-	}
+static void lsc_free(struct lsc_conn *c)
+{
+	lsc_real_close(c->app_fd);
+	lsc_real_close(c->pump_fd);
+	pthread_mutex_destroy(&c->tx_lock);
+	free(c);
+}
 
-	/*
-	 * The local encapsulation port set at init only governs receive.
-	 * usrsctp sends raw SCTP unless each socket is told which remote UDP
-	 * port to encapsulate towards, so mirror the local setting.
-	 */
-	if (g_encaps_port != 0) {
-		struct sctp_udpencaps enc;
-
-		memset(&enc, 0, sizeof(enc));
-		enc.sue_address.ss_family = (sa_family_t)domain;
-		enc.sue_address.ss_len    = sizeof(enc.sue_address);
-		enc.sue_port              = htons(g_encaps_remote_port);
-		if (usrsctp_setsockopt(c->us, IPPROTO_SCTP,
-		                       SCTP_REMOTE_UDP_ENCAPS_PORT, &enc,
-		                       sizeof(enc)) != 0)
-			lsc_log("cannot set remote encapsulation port: %s",
-			        strerror(errno));
-	}
+/* Publish a fully built connection. Returns 0, or -1 with the table full. */
+static int lsc_publish(struct lsc_conn *c)
+{
+	int slot;
 
 	pthread_rwlock_wrlock(&g_lock);
 	for (slot = 0; slot < LSC_MAX_CONNS; slot++) {
@@ -323,17 +316,133 @@ struct lsc_conn *lsc_create(int domain, int type)
 	pthread_rwlock_unlock(&g_lock);
 
 	if (slot == LSC_MAX_CONNS) {
-		usrsctp_close(c->us);
-		lsc_real_close(sv[0]);
-		lsc_real_close(sv[1]);
-		pthread_mutex_destroy(&c->tx_lock);
-		free(c);
 		errno = EMFILE;
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * usrsctp sends to a peer over UDP encapsulation only when the socket has
+ * been told which remote port to encapsulate towards. The port given to
+ * usrsctp_init governs receive alone.
+ */
+static void lsc_set_encaps(struct lsc_conn *c)
+{
+	struct sctp_udpencaps enc;
+
+	if (g_encaps_port == 0)
+		return;
+
+	memset(&enc, 0, sizeof(enc));
+	enc.sue_address.ss_family = (sa_family_t)c->domain;
+	enc.sue_address.ss_len    = sizeof(enc.sue_address);
+	enc.sue_port              = htons(g_encaps_remote_port);
+	if (usrsctp_setsockopt(c->us, IPPROTO_SCTP,
+	                       SCTP_REMOTE_UDP_ENCAPS_PORT, &enc,
+	                       sizeof(enc)) != 0)
+		lsc_log("cannot set remote encapsulation port: %s",
+		        strerror(errno));
+}
+
+struct lsc_conn *lsc_create(int domain, int type)
+{
+	struct lsc_conn *c;
+
+	if (lsc_backend_init() != 0)
+		return NULL;
+
+	c = lsc_alloc(domain, type);
+	if (c == NULL)
+		return NULL;
+
+	c->us = usrsctp_socket(domain, type, IPPROTO_SCTP, lsc_recv_cb, NULL, 0, c);
+	if (c->us == NULL) {
+		int saved = errno;
+		lsc_free(c);
+		errno = saved ? saved : EPROTONOSUPPORT;
+		return NULL;
+	}
+
+	lsc_set_encaps(c);
+
+	if (lsc_publish(c) != 0) {
+		usrsctp_close(c->us);
+		lsc_free(c);
 		return NULL;
 	}
 
 	lsc_log("socket type=%d app_fd=%d us=%p", type, c->app_fd, (void *)c->us);
 	return c;
+}
+
+struct lsc_conn *lsc_adopt(int domain, int type, struct socket *us)
+{
+	struct lsc_conn *c = lsc_alloc(domain, type);
+
+	if (c == NULL)
+		return NULL;
+
+	c->us = us;
+
+	/*
+	 * An accepted socket inherits the listener's receive callback, and
+	 * with it the listener's ulp_info. Point it at this connection, or
+	 * every message on the new association would be pumped into the
+	 * listening socket's descriptor.
+	 */
+	/* register_ulp_info reports success as 1, not 0. It is the odd one
+	 * out: usrsctp_set_upcall and the rest use the POSIX convention. */
+	if (usrsctp_set_ulpinfo(us, c) != 1) {
+		lsc_free(c);
+		errno = EINVAL;
+		return NULL;
+	}
+
+	lsc_set_encaps(c);
+
+	if (lsc_publish(c) != 0) {
+		lsc_free(c);
+		return NULL;
+	}
+
+	lsc_log("adopt type=%d app_fd=%d us=%p", type, c->app_fd, (void *)us);
+	return c;
+}
+
+/*
+ * A listening socket produces no data, so nothing ever writes to its pump
+ * and poll() on the application descriptor would never fire. Ask usrsctp to
+ * tell us when an association is pending, and put one readiness token on
+ * the pump for each. accept() takes one token off again.
+ */
+static void lsc_listen_upcall(struct socket *so, void *arg, int flags)
+{
+	struct lsc_conn *c = arg;
+	unsigned char    token = 0;
+	struct iovec     iov;
+	struct msghdr    msg;
+
+	(void)flags;
+
+	if (c == NULL || !(usrsctp_get_events(so) & SCTP_EVENT_READ))
+		return;
+
+	iov.iov_base = &token;
+	iov.iov_len  = sizeof(token);
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_iov    = &iov;
+	msg.msg_iovlen = 1;
+
+	if (lsc_real_sendmsg(c->pump_fd, &msg, 0) < 0)
+		lsc_log("listen pump write failed on app_fd=%d: %s",
+		        c->app_fd, strerror(errno));
+}
+
+int lsc_listen_arm(struct lsc_conn *c)
+{
+	c->listening = 1;
+	return usrsctp_set_upcall(c->us, lsc_listen_upcall, c);
 }
 
 void lsc_destroy(struct lsc_conn *c)
@@ -458,7 +567,9 @@ int lsc_recv_cb(struct socket *sock, union sctp_sockstore addr, void *data,
 	msg.msg_iov    = iov;
 	msg.msg_iovlen = hdr.payload_len > 0 ? 2 : 1;
 
-	if (sendmsg(c->pump_fd, &msg, 0) < 0)
+	/* lsc_real_sendmsg, not sendmsg: we export the latter now, and a
+	 * plain call would bind to our own definition and recurse. */
+	if (lsc_real_sendmsg(c->pump_fd, &msg, 0) < 0)
 		lsc_log("pump write failed on app_fd=%d: %s",
 		        c->app_fd, strerror(errno));
 

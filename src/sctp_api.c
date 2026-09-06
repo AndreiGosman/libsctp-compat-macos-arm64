@@ -56,7 +56,7 @@ static const struct sockaddr *lsc_fix_sa_local(const struct sockaddr *sa,
 	return (const struct sockaddr *)out;
 }
 
-static ssize_t lsc_sendv(struct lsc_conn *c, const void *msg, size_t len,
+ssize_t lsc_sendv(struct lsc_conn *c, const void *msg, size_t len,
                          const struct sockaddr *to, socklen_t tolen,
                          uint32_t ppid, uint16_t flags, uint16_t stream,
                          uint32_t context, uint32_t assoc_id, int sendflags)
@@ -226,7 +226,9 @@ ssize_t sctp_recvmsg(int sd, void *msg, size_t len,
 	 * payload exactly as a kernel SCTP socket would, and the kernel sets
 	 * MSG_TRUNC for us on the socketpair read.
 	 */
-	n = recvmsg(c->app_fd, &mh, 0);
+	/* lsc_real_recvmsg, not recvmsg: we export the latter now, and a
+	 * plain call would bind to our own definition and recurse. */
+	n = lsc_real_recvmsg(c->app_fd, &mh, 0);
 	if (n < 0)
 		return -1;
 

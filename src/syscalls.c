@@ -87,7 +87,74 @@ int listen(int fd, int backlog)
 	if (c == NULL)
 		return lsc_real_listen(fd, backlog);
 
-	return usrsctp_listen(c->us, backlog);
+	if (usrsctp_listen(c->us, backlog) != 0)
+		return -1;
+
+	/* From here on the descriptor reports readable when an association
+	 * is waiting, so poll() driven servers work unchanged. */
+	if (lsc_listen_arm(c) != 0) {
+		lsc_log("cannot arm listen pump on fd=%d: %s", fd,
+		        strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
+{
+	struct lsc_conn *c = lsc_lookup(fd);
+	struct lsc_conn *nc;
+	struct socket   *ns;
+	unsigned char    token;
+	struct iovec     iov;
+	struct msghdr    mh;
+	socklen_t        alen;
+	struct sockaddr_storage ss;
+
+	if (c == NULL)
+		return lsc_real_accept(fd, addr, addrlen);
+
+	if (!c->listening) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	alen = sizeof(ss);
+	memset(&ss, 0, sizeof(ss));
+	ns = usrsctp_accept(c->us, (struct sockaddr *)&ss, &alen);
+	if (ns == NULL) {
+		lsc_log("usrsctp_accept on fd=%d failed: %s (events=0x%x)", fd,
+		        strerror(errno), usrsctp_get_events(c->us));
+		return -1;
+	}
+
+	/*
+	 * Take one readiness token off the pump for the association we just
+	 * accepted. Do it after the accept succeeds, so a failed accept
+	 * leaves the descriptor readable and the caller comes back.
+	 */
+	iov.iov_base = &token;
+	iov.iov_len  = sizeof(token);
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov    = &iov;
+	mh.msg_iovlen = 1;
+	(void)lsc_real_recvmsg(c->app_fd, &mh, MSG_DONTWAIT);
+
+	nc = lsc_adopt(c->domain, c->type, ns);
+	if (nc == NULL) {
+		int saved = errno;
+		usrsctp_close(ns);
+		errno = saved;
+		return -1;
+	}
+
+	if (addr != NULL && addrlen != NULL) {
+		socklen_t want = alen < *addrlen ? alen : *addrlen;
+		memcpy(addr, &ss, want);
+		*addrlen = alen;
+	}
+
+	return nc->app_fd;
 }
 
 int connect(int fd, const struct sockaddr *addr, socklen_t len)
@@ -271,4 +338,210 @@ int getpeername(int fd, struct sockaddr *addr, socklen_t *len)
 	if (addrs != NULL)
 		usrsctp_freepaddrs(addrs);
 	return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* raw sendmsg and recvmsg on an SCTP descriptor                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Ancillary data on IPPROTO_SCTP. Our public netinet/sctp.h names these,
+ * but that header and usrsctp.h cannot both be included here, so the two
+ * values this library understands are repeated. They follow lksctp.
+ */
+#define LSC_CMSG_SNDRCV  1
+#define LSC_CMSG_SNDINFO 2
+
+/*
+ * Callers that use osmo_io, or any other layer that drives sockets through
+ * sendmsg and recvmsg rather than the sctp_*() helpers, reach these. The
+ * SCTP parameters travel in a control message instead of in arguments; the
+ * payload travels in an iovec instead of one flat buffer. Unpack both and
+ * join the same path that sctp_sendmsg uses.
+ */
+ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
+{
+	struct lsc_conn        *c = lsc_lookup(fd);
+	const struct cmsghdr   *cm;
+	struct lsc_sndrcvinfo   sri;
+	struct sockaddr_storage ss;
+	const struct sockaddr  *dst = NULL;
+	socklen_t               dstlen = 0;
+	unsigned char          *buf = NULL;
+	const void             *payload;
+	size_t                  total = 0;
+	ssize_t                 rc;
+	int                     i;
+
+	if (c == NULL)
+		return lsc_real_sendmsg(fd, msg, flags);
+
+	if (msg == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	memset(&sri, 0, sizeof(sri));
+
+	for (cm = CMSG_FIRSTHDR((struct msghdr *)msg); cm != NULL;
+	     cm = CMSG_NXTHDR((struct msghdr *)msg, (struct cmsghdr *)cm)) {
+		if (cm->cmsg_level != IPPROTO_SCTP)
+			continue;
+
+		if (cm->cmsg_type == LSC_CMSG_SNDRCV &&
+		    cm->cmsg_len >= CMSG_LEN(sizeof(sri))) {
+			memcpy(&sri, CMSG_DATA((struct cmsghdr *)cm), sizeof(sri));
+		} else if (cm->cmsg_type == LSC_CMSG_SNDINFO &&
+		           cm->cmsg_len >= CMSG_LEN(sizeof(struct sctp_sndinfo))) {
+			struct sctp_sndinfo si;
+
+			memcpy(&si, CMSG_DATA((struct cmsghdr *)cm), sizeof(si));
+			sri.sinfo_stream   = si.snd_sid;
+			sri.sinfo_flags    = si.snd_flags;
+			sri.sinfo_ppid     = si.snd_ppid;
+			sri.sinfo_context  = si.snd_context;
+			sri.sinfo_assoc_id = si.snd_assoc_id;
+		}
+	}
+
+	if (msg->msg_name != NULL && msg->msg_namelen > 0) {
+		dst    = lsc_fix_sa(msg->msg_name, msg->msg_namelen, &ss);
+		dstlen = msg->msg_namelen;
+	}
+
+	for (i = 0; i < (int)msg->msg_iovlen; i++)
+		total += msg->msg_iov[i].iov_len;
+
+	if (total > LSC_MAX_MSG) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+
+	/* One buffer is the common case and needs no copy. */
+	if (msg->msg_iovlen == 1) {
+		payload = msg->msg_iov[0].iov_base;
+	} else {
+		size_t off = 0;
+
+		buf = malloc(total ? total : 1);
+		if (buf == NULL) {
+			errno = ENOMEM;
+			return -1;
+		}
+		for (i = 0; i < (int)msg->msg_iovlen; i++) {
+			memcpy(buf + off, msg->msg_iov[i].iov_base,
+			       msg->msg_iov[i].iov_len);
+			off += msg->msg_iov[i].iov_len;
+		}
+		payload = buf;
+	}
+
+	rc = lsc_sendv(c, payload, total, dst, dstlen, sri.sinfo_ppid,
+	               sri.sinfo_flags, sri.sinfo_stream, sri.sinfo_context,
+	               sri.sinfo_assoc_id, flags);
+
+	free(buf);
+	return rc;
+}
+
+ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
+{
+	struct lsc_conn *c = lsc_lookup(fd);
+	struct lsc_frame hdr;
+	unsigned char   *buf;
+	struct iovec     riov[2];
+	struct msghdr    rmh;
+	ssize_t          n;
+	size_t           payload, copied = 0;
+	int              i;
+
+	if (c == NULL)
+		return lsc_real_recvmsg(fd, msg, flags);
+
+	if (msg == NULL) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	buf = malloc(LSC_MAX_MSG);
+	if (buf == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	/*
+	 * Read the whole frame first. Scattering straight into the caller's
+	 * iovec would work only while the header and the payload land on the
+	 * boundary the caller happens to have chosen.
+	 */
+	riov[0].iov_base = &hdr;
+	riov[0].iov_len  = sizeof(hdr);
+	riov[1].iov_base = buf;
+	riov[1].iov_len  = LSC_MAX_MSG;
+
+	memset(&rmh, 0, sizeof(rmh));
+	rmh.msg_iov    = riov;
+	rmh.msg_iovlen = 2;
+
+	n = lsc_real_recvmsg(c->app_fd, &rmh, flags);
+	if (n < 0) {
+		free(buf);
+		return -1;
+	}
+	if ((size_t)n < sizeof(hdr) || hdr.magic != LSC_FRAME_MAGIC) {
+		lsc_log("malformed frame on app_fd=%d, %zd bytes", c->app_fd, n);
+		free(buf);
+		errno = EPROTO;
+		return -1;
+	}
+
+	payload = (size_t)n - sizeof(hdr);
+
+	for (i = 0; i < (int)msg->msg_iovlen && copied < payload; i++) {
+		size_t take = payload - copied;
+
+		if (take > msg->msg_iov[i].iov_len)
+			take = msg->msg_iov[i].iov_len;
+		memcpy(msg->msg_iov[i].iov_base, buf + copied, take);
+		copied += take;
+	}
+
+	msg->msg_flags = hdr.flags | (rmh.msg_flags & MSG_TRUNC);
+	if (copied < payload)
+		msg->msg_flags |= MSG_TRUNC;
+
+	if (msg->msg_name != NULL && msg->msg_namelen > 0 && hdr.fromlen > 0) {
+		socklen_t want = hdr.fromlen;
+
+		if (want > msg->msg_namelen)
+			want = msg->msg_namelen;
+		memcpy(msg->msg_name, &hdr.from, want);
+		msg->msg_namelen = hdr.fromlen;
+	} else {
+		msg->msg_namelen = 0;
+	}
+
+	/*
+	 * Hand the sender information back as an SCTP_SNDRCV control message,
+	 * which is where a caller written for lksctp looks for it. Too small
+	 * a control buffer is reported the way the kernel reports it, with
+	 * MSG_CTRUNC, rather than as a failure.
+	 */
+	if (msg->msg_control != NULL &&
+	    msg->msg_controllen >= CMSG_SPACE(sizeof(hdr.sri))) {
+		struct cmsghdr *cm = CMSG_FIRSTHDR(msg);
+
+		cm->cmsg_level = IPPROTO_SCTP;
+		cm->cmsg_type  = LSC_CMSG_SNDRCV;
+		cm->cmsg_len   = CMSG_LEN(sizeof(hdr.sri));
+		memcpy(CMSG_DATA(cm), &hdr.sri, sizeof(hdr.sri));
+		msg->msg_controllen = CMSG_SPACE(sizeof(hdr.sri));
+	} else {
+		if (msg->msg_controllen > 0)
+			msg->msg_flags |= MSG_CTRUNC;
+		msg->msg_controllen = 0;
+	}
+
+	free(buf);
+	return (ssize_t)copied;
 }

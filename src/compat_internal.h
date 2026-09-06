@@ -63,6 +63,9 @@ struct lsc_conn {
 	struct sockaddr_storage peer;
 	socklen_t               peerlen;
 	unsigned                connects;
+	/* Set by listen(). A listening socket never receives data, so its
+	 * pump carries one readiness token per pending association instead. */
+	int             listening;
 	pthread_mutex_t tx_lock;
 };
 
@@ -71,7 +74,12 @@ struct lsc_conn {
 void            lsc_registry_init(void);
 struct lsc_conn *lsc_lookup(int fd);
 struct lsc_conn *lsc_create(int domain, int type);
+/* Wrap a usrsctp socket we did not create, as accept() returns. */
+struct lsc_conn *lsc_adopt(int domain, int type, struct socket *us);
 void            lsc_destroy(struct lsc_conn *c);
+
+/* Arms the readiness pump on a listening socket. */
+int lsc_listen_arm(struct lsc_conn *c);
 
 /* Lazy one-time usrsctp_init. Returns 0 on success, -1 with errno set. */
 int lsc_backend_init(void);
@@ -94,6 +102,16 @@ int  lsc_real_getsockopt(int fd, int level, int name, void *val,
 int  lsc_real_getsockname(int fd, struct sockaddr *addr, socklen_t *len);
 int  lsc_real_getpeername(int fd, struct sockaddr *addr, socklen_t *len);
 int  lsc_real_shutdown(int fd, int how);
+ssize_t lsc_real_sendmsg(int fd, const struct msghdr *msg, int flags);
+ssize_t lsc_real_recvmsg(int fd, struct msghdr *msg, int flags);
+int  lsc_real_accept(int fd, struct sockaddr *addr, socklen_t *len);
+
+/* The one send path into usrsctp. sctp_sendmsg, sctp_send and the
+ * interposed sendmsg all funnel through it. */
+ssize_t lsc_sendv(struct lsc_conn *c, const void *msg, size_t len,
+                  const struct sockaddr *to, socklen_t tolen,
+                  uint32_t ppid, uint16_t flags, uint16_t stream,
+                  uint32_t context, uint32_t assoc_id, int sendflags);
 
 /* Debug logging, enabled by LIBSCTP_COMPAT_DEBUG=1. */
 void lsc_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
