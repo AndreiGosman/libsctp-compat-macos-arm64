@@ -75,30 +75,156 @@ typedef uint32_t sctp_assoc_t;
 /* Notification types and states                                       */
 /* ------------------------------------------------------------------ */
 
-#define SCTP_ASSOC_CHANGE           0x0001
-#define SCTP_PEER_ADDR_CHANGE       0x0002
-#define SCTP_REMOTE_ERROR           0x0003
-#define SCTP_SEND_FAILED            0x0004
-#define SCTP_SHUTDOWN_EVENT         0x0005
-#define SCTP_ADAPTATION_INDICATION  0x0006
-#define SCTP_PARTIAL_DELIVERY_EVENT 0x0007
-#define SCTP_AUTHENTICATION_EVENT   0x0008
-#define SCTP_SENDER_DRY_EVENT       0x0009
+/* lksctp gives each of these groups a named enum type, and application code
+ * uses those names as function parameter and struct field types. The names
+ * must therefore exist as types here, not only as constants. Every group
+ * below follows the lksctp idiom of an enum plus a self-referential #define
+ * per member, so that "#ifdef SCTP_FOO" still answers the question that
+ * portable code asks with it.
+ *
+ * The VALUES are usrsctp's, not Linux's, wherever usrsctp reports the field
+ * at runtime. The two stacks disagree: lksctp numbers sctp_sac_state from 0,
+ * usrsctp from 1. Taking the Linux numbers would mistranslate every
+ * notification this library delivers.
+ *
+ * A member marked "not reported by usrsctp" exists only so that code which
+ * enumerates the full lksctp set still compiles. It is given a value that
+ * collides with nothing in its group, and it never arrives from the stack.
+ */
 
-/* sac_state */
-#define SCTP_COMM_UP        0x0001
-#define SCTP_COMM_LOST      0x0002
-#define SCTP_RESTART        0x0003
-#define SCTP_SHUTDOWN_COMP  0x0004
-#define SCTP_CANT_STR_ASSOC 0x0005
+/* sn_type: the notification type in sctp_tlv.sn_type */
+enum sctp_sn_type {
+	SCTP_ASSOC_CHANGE           = 0x0001,
+	SCTP_PEER_ADDR_CHANGE       = 0x0002,
+	SCTP_REMOTE_ERROR           = 0x0003,
+	SCTP_SEND_FAILED            = 0x0004,
+	SCTP_SHUTDOWN_EVENT         = 0x0005,
+	SCTP_ADAPTATION_INDICATION  = 0x0006,
+	SCTP_PARTIAL_DELIVERY_EVENT = 0x0007,
+	SCTP_AUTHENTICATION_EVENT   = 0x0008,
+	SCTP_SENDER_DRY_EVENT       = 0x0009,
+};
+#define SCTP_ASSOC_CHANGE           SCTP_ASSOC_CHANGE
+#define SCTP_PEER_ADDR_CHANGE       SCTP_PEER_ADDR_CHANGE
+#define SCTP_REMOTE_ERROR           SCTP_REMOTE_ERROR
+#define SCTP_SEND_FAILED            SCTP_SEND_FAILED
+#define SCTP_SHUTDOWN_EVENT         SCTP_SHUTDOWN_EVENT
+#define SCTP_ADAPTATION_INDICATION  SCTP_ADAPTATION_INDICATION
+#define SCTP_PARTIAL_DELIVERY_EVENT SCTP_PARTIAL_DELIVERY_EVENT
+#define SCTP_AUTHENTICATION_EVENT   SCTP_AUTHENTICATION_EVENT
+#define SCTP_SENDER_DRY_EVENT       SCTP_SENDER_DRY_EVENT
 
-/* spc_state */
-#define SCTP_ADDR_AVAILABLE   0x0001
-#define SCTP_ADDR_UNREACHABLE 0x0002
-#define SCTP_ADDR_REMOVED     0x0003
-#define SCTP_ADDR_ADDED       0x0004
-#define SCTP_ADDR_MADE_PRIM   0x0005
-#define SCTP_ADDR_CONFIRMED   0x0006
+/* sac_state: sctp_assoc_change.sac_state */
+enum sctp_sac_state {
+	SCTP_COMM_UP        = 0x0001,
+	SCTP_COMM_LOST      = 0x0002,
+	SCTP_RESTART        = 0x0003,
+	SCTP_SHUTDOWN_COMP  = 0x0004,
+	SCTP_CANT_STR_ASSOC = 0x0005,
+};
+#define SCTP_COMM_UP        SCTP_COMM_UP
+#define SCTP_COMM_LOST      SCTP_COMM_LOST
+#define SCTP_RESTART        SCTP_RESTART
+#define SCTP_SHUTDOWN_COMP  SCTP_SHUTDOWN_COMP
+#define SCTP_CANT_STR_ASSOC SCTP_CANT_STR_ASSOC
+
+/* spc_state: sctp_paddr_change.spc_state */
+enum sctp_spc_state {
+	SCTP_ADDR_AVAILABLE   = 0x0001,
+	SCTP_ADDR_UNREACHABLE = 0x0002,
+	SCTP_ADDR_REMOVED     = 0x0003,
+	SCTP_ADDR_ADDED       = 0x0004,
+	SCTP_ADDR_MADE_PRIM   = 0x0005,
+	SCTP_ADDR_CONFIRMED   = 0x0006,
+};
+#define SCTP_ADDR_AVAILABLE   SCTP_ADDR_AVAILABLE
+#define SCTP_ADDR_UNREACHABLE SCTP_ADDR_UNREACHABLE
+#define SCTP_ADDR_REMOVED     SCTP_ADDR_REMOVED
+#define SCTP_ADDR_ADDED       SCTP_ADDR_ADDED
+#define SCTP_ADDR_MADE_PRIM   SCTP_ADDR_MADE_PRIM
+#define SCTP_ADDR_CONFIRMED   SCTP_ADDR_CONFIRMED
+
+/* sn_error: sctp_paddr_change.spc_error and sctp_remote_error.sre_error.
+ * usrsctp does not report this set. It puts an errno-like value in spc_error
+ * instead, so every member here is informational and the numbering follows
+ * lksctp. */
+enum sctp_sn_error {
+	SCTP_FAILED_THRESHOLD       = 0,
+	SCTP_RECEIVED_SACK          = 1,
+	SCTP_HEARTBEAT_SUCCESS      = 2,
+	SCTP_RESPONSE_TO_USER_REQ   = 3,
+	SCTP_INTERNAL_ERROR         = 4,
+	SCTP_SHUTDOWN_GUARD_EXPIRES = 5,
+	SCTP_PEER_FAULTY            = 6,
+};
+#define SCTP_FAILED_THRESHOLD       SCTP_FAILED_THRESHOLD
+#define SCTP_RECEIVED_SACK          SCTP_RECEIVED_SACK
+#define SCTP_HEARTBEAT_SUCCESS      SCTP_HEARTBEAT_SUCCESS
+#define SCTP_RESPONSE_TO_USER_REQ   SCTP_RESPONSE_TO_USER_REQ
+#define SCTP_INTERNAL_ERROR         SCTP_INTERNAL_ERROR
+#define SCTP_SHUTDOWN_GUARD_EXPIRES SCTP_SHUTDOWN_GUARD_EXPIRES
+#define SCTP_PEER_FAULTY            SCTP_PEER_FAULTY
+
+/* spinfo_state: sctp_paddrinfo.spinfo_state. usrsctp values. */
+enum sctp_spinfo_state {
+	SCTP_ACTIVE      = 0x0001,
+	SCTP_INACTIVE    = 0x0002,
+	SCTP_PF          = 0x0004,  /* not reported by usrsctp */
+	SCTP_UNCONFIRMED = 0x0200,
+	SCTP_UNKNOWN     = 0xffff,  /* not reported by usrsctp */
+};
+#define SCTP_ACTIVE      SCTP_ACTIVE
+#define SCTP_INACTIVE    SCTP_INACTIVE
+#define SCTP_PF          SCTP_PF
+#define SCTP_UNCONFIRMED SCTP_UNCONFIRMED
+#define SCTP_UNKNOWN     SCTP_UNKNOWN
+
+/* sstat_state: sctp_status.sstat_state. usrsctp values. */
+enum sctp_sstat_state {
+	SCTP_CLOSED            = 0x0000,
+	SCTP_COOKIE_WAIT       = 0x0002,
+	SCTP_COOKIE_ECHOED     = 0x0004,
+	SCTP_ESTABLISHED       = 0x0008,
+	SCTP_SHUTDOWN_SENT     = 0x0010,
+	SCTP_SHUTDOWN_RECEIVED = 0x0020,
+	SCTP_SHUTDOWN_ACK_SENT = 0x0040,
+	SCTP_SHUTDOWN_PENDING  = 0x0080,
+	SCTP_BOUND             = 0x1000,
+	SCTP_LISTEN            = 0x2000,
+	SCTP_EMPTY             = 0x8000,  /* not reported by usrsctp */
+};
+#define SCTP_CLOSED            SCTP_CLOSED
+#define SCTP_COOKIE_WAIT       SCTP_COOKIE_WAIT
+#define SCTP_COOKIE_ECHOED     SCTP_COOKIE_ECHOED
+#define SCTP_ESTABLISHED       SCTP_ESTABLISHED
+#define SCTP_SHUTDOWN_SENT     SCTP_SHUTDOWN_SENT
+#define SCTP_SHUTDOWN_RECEIVED SCTP_SHUTDOWN_RECEIVED
+#define SCTP_SHUTDOWN_ACK_SENT SCTP_SHUTDOWN_ACK_SENT
+#define SCTP_SHUTDOWN_PENDING  SCTP_SHUTDOWN_PENDING
+#define SCTP_BOUND             SCTP_BOUND
+#define SCTP_LISTEN            SCTP_LISTEN
+#define SCTP_EMPTY             SCTP_EMPTY
+
+/* cmsg_type for ancillary data on IPPROTO_SCTP, lksctp numbering.
+ *
+ * WARNING: this library does not interpose sendmsg() or recvmsg(). Code that
+ * builds or parses these control messages talks straight to libc, which knows
+ * nothing about the usrsctp association behind the descriptor. The constants
+ * are here so that such code compiles; it will not carry SCTP data. Use
+ * sctp_sendmsg() and sctp_recvmsg(), which this library does implement.
+ */
+enum sctp_cmsg_type {
+	SCTP_INIT    = 0,
+	SCTP_SNDRCV  = 1,
+	SCTP_SNDINFO = 2,
+	SCTP_RCVINFO = 3,
+	SCTP_NXTINFO = 4,
+};
+#define SCTP_INIT    SCTP_INIT
+#define SCTP_SNDRCV  SCTP_SNDRCV
+#define SCTP_SNDINFO SCTP_SNDINFO
+#define SCTP_RCVINFO SCTP_RCVINFO
+#define SCTP_NXTINFO SCTP_NXTINFO
 
 /* sctp_bindx flags */
 #define SCTP_BINDX_ADD_ADDR 0x00008001
