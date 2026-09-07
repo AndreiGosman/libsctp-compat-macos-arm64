@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 cmake_minimum_required(VERSION 3.16)
-project(libsctp-compat VERSION 0.1.0 LANGUAGES C CXX)
+project(libsctp-compat VERSION 0.3.1 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
