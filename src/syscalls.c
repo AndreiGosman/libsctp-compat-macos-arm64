@@ -90,6 +90,20 @@ int listen(int fd, int backlog)
 	if (usrsctp_listen(c->us, backlog) != 0)
 		return -1;
 
+	c->listening = 1;
+
+	/*
+	 * Only a one-to-one socket hands out connections through accept(), and
+	 * only its descriptor needs the readiness pump. On a one-to-many socket
+	 * listen() merely allows incoming associations: the data arrives on
+	 * this same descriptor through the receive callback, which is how
+	 * srsRAN's MME uses it. Arming the accept machinery there would set
+	 * the backend non-blocking and take over a descriptor that is carrying
+	 * real traffic.
+	 */
+	if (c->type != SOCK_STREAM)
+		return 0;
+
 	/* From here on the descriptor reports readable when an association
 	 * is waiting, so poll() driven servers work unchanged. */
 	if (lsc_listen_arm(c) != 0) {
@@ -122,8 +136,22 @@ int accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
 	 * one token, keeping the two in step: a descriptor that still reads
 	 * as readable means another connection is queued behind this one.
 	 */
+	iov.iov_base = &token;
+	iov.iov_len  = sizeof(token);
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov    = &iov;
+	mh.msg_iovlen = 1;
+
 	nc = lsc_accept_pop(c);
 	if (nc == NULL) {
+		/*
+		 * Nothing queued, so anything sitting on the pump is stale.
+		 * Take one datagram off anyway. The upcall queues the
+		 * connection before it writes the token, so a token always has
+		 * its entry behind it; leaving a stray one would keep the
+		 * descriptor readable and spin the caller's event loop.
+		 */
+		(void)lsc_real_recvmsg(c->app_fd, &mh, MSG_DONTWAIT);
 		errno = EAGAIN;
 		return -1;
 	}

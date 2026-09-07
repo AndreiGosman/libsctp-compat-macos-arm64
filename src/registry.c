@@ -769,6 +769,25 @@ int lsc_recv_cb(struct socket *sock, union sctp_sockstore addr, void *data,
 		return 1;
 	}
 
+	/*
+	 * A listening socket's pump carries readiness tokens and nothing else.
+	 * usrsctp still reports notifications on it, and framing one here would
+	 * leave a datagram that accept() has no connection for: the descriptor
+	 * stays readable, accept() answers EAGAIN, and a poll loop spins on it
+	 * for good. osmo-stp reached exactly that, on a listener bound to
+	 * thirteen addresses, before any peer existed.
+	 *
+	 * One-to-many is the exception and must not be caught here: there
+	 * listen() only allows associations in, and the data for every one of
+	 * them arrives on this same descriptor.
+	 */
+	if (c->listening && c->type == SOCK_STREAM) {
+		lsc_log("dropping %zu bytes reported on listening app_fd=%d "
+		        "(flags=0x%x)", datalen, c->app_fd, flags);
+		free(data);
+		return 1;
+	}
+
 	memset(&from, 0, sizeof(from));
 	switch (addr.sa.sa_family) {
 	case AF_INET:
