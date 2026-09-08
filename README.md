@@ -126,6 +126,8 @@ and the backend.
 | `bind`, `listen`, `connect`, `shutdown` | `usrsctp_bind`, `_listen`, `_connect`, `_shutdown` |
 | `setsockopt`, `getsockopt` at `IPPROTO_SCTP` | `usrsctp_setsockopt`, `usrsctp_getsockopt` |
 | `setsockopt` at `SOL_SOCKET` for timeouts and buffers | the socketpair descriptor |
+| `setsockopt(SOL_SOCKET, SO_NOSIGPIPE)` | accepted as a no-op, usrsctp never raises SIGPIPE (since v0.3.2) |
+| `getsockopt(IPPROTO_SCTP, SCTP_STATUS)` | `usrsctp_getsockopt`; the RFC 6458 `struct sctp_status` has the same layout in lksctp and usrsctp, so it passes through |
 | `getsockname`, `getpeername` | first entry of `usrsctp_getladdrs`, `_getpaddrs` |
 | `sctp_sendmsg`, `sctp_send` | `usrsctp_sendv` with `SCTP_SENDV_SNDINFO` |
 | `sctp_recvmsg` | `recvmsg` on the socketpair, fed by the receive callback |
@@ -270,6 +272,14 @@ reports nothing readable and burns no CPU, and that no reply reaches the wrong
 client. A watchdog ends the run after thirty seconds, because the first two
 failures show up as "never finishes" rather than as a wrong answer.
 
+Since v0.3.2 `setsockopt(SOL_SOCKET, SO_NOSIGPIPE)` succeeds as a no-op: libosmo-netif
+sets it on every stream client and server connection and logged `Failed setting
+SO_NOSIGPIPE: Invalid argument` once per association, because the option was handed
+to `usrsctp_setsockopt()`, which rejects `SOL_SOCKET`. usrsctp never raises SIGPIPE.
+The interpose test now also asks for `SCTP_STATUS` on the client after `connect()`
+and on the accepted descriptor and checks state `SCTP_ESTABLISHED` and the primary
+peer address.
+
 `SCTP_GET_PEER_ADDR_INFO` and the `sstat_primary` member of `SCTP_STATUS` now
 return real data. Until v0.3.0 `struct sctp_paddrinfo` was declared in lksctp
 member order while the bytes were handed to usrsctp, which expects the address
@@ -310,6 +320,15 @@ nm -mu $HOME/sdr-lab/local/lib/libosmonetif.dylib | \
 
 Every line should say `(from libsctp)`. A line saying `(from libSystem)` is a
 consumer that still needs relinking.
+
+The same applies to `setsockopt` and `getsockopt`. In the osmo stack on this
+machine libosmo-netif and libosmo-sigtran bind both to this library, while the
+osmo-hnbgw and osmo-msc executables bind `getsockopt` and `setsockopt` to
+libSystem (`dyld_info -fixups <binary> | grep sockopt` shows it). That is why
+`show hnb` in osmo-hnbgw still prints `getsockopt(SCTP_STATUS) failed:
+Operation not supported on socket`: the call never reaches the shim and lands
+on the socketpair. `sctp_interpose_test` shows the option working on a
+descriptor that does; the fix for the daemon is a relink, not a shim change.
 
 ## License
 
