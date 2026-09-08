@@ -265,6 +265,17 @@ int setsockopt(int fd, int level, int name, const void *val, socklen_t len)
 		case SO_REUSEADDR:
 		case SO_REUSEPORT:
 			return lsc_real_setsockopt(fd, level, name, val, len);
+#ifdef SO_NOSIGPIPE
+		/*
+		 * libosmo-netif sets SO_NOSIGPIPE on every stream client and
+		 * server connection where the option exists. usrsctp never
+		 * raises SIGPIPE, and usrsctp_setsockopt() would answer EINVAL
+		 * for SOL_SOCKET, which the caller logs as an error on every
+		 * association. Accept the request as a no-op.
+		 */
+		case SO_NOSIGPIPE:
+			return 0;
+#endif
 		default:
 			break;
 		}

@@ -147,6 +147,27 @@ static int run_client(void)
   if (connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) {
     return 1;
   }
+#ifdef SO_NOSIGPIPE
+  /*
+   * libosmo-netif sets this on every connection; the shim has to accept it
+   * (usrsctp never raises SIGPIPE) instead of failing with EINVAL.
+   */
+  {
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) != 0) {
+      return 3;
+    }
+  }
+#endif
+  /* SCTP_STATUS on an established one-to-one client: real state and peer */
+  {
+    struct sctp_status st;
+    socklen_t          sl = sizeof(st);
+    memset(&st, 0, sizeof(st));
+    if (getsockopt(fd, IPPROTO_SCTP, SCTP_STATUS, &st, &sl) != 0 || st.sstat_state == 0) {
+      return 4;
+    }
+  }
   if (raw_send(fd, REQ, PPID) != (ssize_t)strlen(REQ)) {
     return 1;
   }
@@ -217,6 +238,28 @@ int main(int argc, char** argv)
     return 1;
   }
 
+  {
+    /*
+     * SCTP_STATUS on the accepted descriptor: osmo-hnbgw's "show hnb"
+     * asks for it and prints the state, streams, windows and primary peer.
+     */
+    struct sctp_status  st;
+    socklen_t           sl = sizeof(st);
+    struct sockaddr_in* prim = (struct sockaddr_in*)&st.sstat_primary.spinfo_address;
+    int                 rc;
+    memset(&st, 0, sizeof(st));
+    rc = getsockopt(conn, IPPROTO_SCTP, SCTP_STATUS, &st, &sl);
+    check("SCTP_STATUS on the accepted descriptor", rc == 0);
+    check("SCTP_STATUS reports an established state", rc == 0 && st.sstat_state == SCTP_ESTABLISHED);
+    check("SCTP_STATUS reports the peer as primary",
+          rc == 0 && prim->sin_family == AF_INET && prim->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    if (rc == 0) {
+      printf("  sstat_state %d rwnd %u instrms %u outstrms %u primary %s:%u\n",
+             st.sstat_state, st.sstat_rwnd, st.sstat_instrms, st.sstat_outstrms,
+             inet_ntoa(prim->sin_addr), ntohs(prim->sin_port));
+    }
+  }
+
   n = raw_recv(conn, buf, sizeof(buf), &ppid, 16);
   check("request received through raw recvmsg",
         n == (ssize_t)strlen(REQ) && memcmp(buf, REQ, n) == 0);
@@ -229,6 +272,8 @@ int main(int argc, char** argv)
   {
     int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     check("client completed", rc == 0 || rc == 2);
+    check("client SO_NOSIGPIPE accepted", rc != 3);
+    check("client SCTP_STATUS after connect", rc != 4);
     check("client received the reply", rc == 0);
   }
 
