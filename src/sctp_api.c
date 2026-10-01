@@ -11,6 +11,9 @@
 
 #include "compat_internal.h"
 
+/* Upper bound on the addresses one sctp_connectx() call can carry. */
+#define LSC_CONNECTX_MAX 32
+
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,6 +140,19 @@ ssize_t lsc_sendv(struct lsc_conn *c, const void *msg, size_t len,
 	if (dst == NULL && assoc_id == 0 && c->peerlen > 0) {
 		dst    = (const struct sockaddr *)&c->peer;
 		tolen  = c->peerlen;
+	}
+
+	/*
+	 * Linux accepts a zero-length send whose only purpose is the flag it
+	 * carries: sendmsg() with an empty iovec and SCTP_EOF or SCTP_ABORT in
+	 * the control message shuts the association down or aborts it. That
+	 * is how OCUDU closes an association. usrsctp_sendv() refuses a NULL
+	 * data pointer with EFAULT before it looks at the length, so hand it
+	 * a valid pointer to nothing.
+	 */
+	if (msg == NULL && len == 0) {
+		static const unsigned char empty;
+		msg = &empty;
 	}
 
 	pthread_mutex_lock(&c->tx_lock);
@@ -310,13 +326,64 @@ int sctp_bindx(int sd, struct sockaddr *addrs, int addrcnt, int flags)
 int sctp_connectx(int sd, struct sockaddr *addrs, int addrcnt,
                   sctp_assoc_t *id)
 {
-	struct lsc_conn *c = lsc_lookup(sd);
+	struct lsc_conn        *c = lsc_lookup(sd);
+	struct sockaddr_storage fixed[LSC_CONNECTX_MAX];
+	unsigned char          *packed;
+	size_t                  total = 0;
+	struct sockaddr        *p     = addrs;
+	int                     i, rc;
 
 	if (c == NULL) {
 		errno = ENOTSOCK;
 		return -1;
 	}
-	return usrsctp_connectx(c->us, addrs, addrcnt, id);
+	if (addrs == NULL || addrcnt <= 0 || addrcnt > LSC_CONNECTX_MAX) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	/*
+	 * usrsctp reads sa_len, which a Linux caller leaves at zero because
+	 * its sockaddrs have no such field, and answers EINVAL. sctp_bindx
+	 * already normalises every entry; do the same here, repacking the
+	 * variable-length list usrsctp_connectx expects.
+	 */
+	for (i = 0; i < addrcnt; i++) {
+		socklen_t step;
+
+		switch (p->sa_family) {
+		case AF_INET:
+			step = sizeof(struct sockaddr_in);
+			break;
+		case AF_INET6:
+			step = sizeof(struct sockaddr_in6);
+			break;
+		default:
+			errno = EAFNOSUPPORT;
+			return -1;
+		}
+		memcpy(&fixed[i], lsc_fix_sa_local(p, step, &fixed[i]), step);
+		total += step;
+		p = (struct sockaddr *)((char *)p + step);
+	}
+
+	packed = malloc(total);
+	if (packed == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	total = 0;
+	for (i = 0; i < addrcnt; i++) {
+		socklen_t step = fixed[i].ss_family == AF_INET6 ?
+		    sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+
+		memcpy(packed + total, &fixed[i], step);
+		total += step;
+	}
+
+	rc = usrsctp_connectx(c->us, (struct sockaddr *)packed, addrcnt, id);
+	free(packed);
+	return rc;
 }
 
 int sctp_getpaddrs(int sd, sctp_assoc_t id, struct sockaddr **addrs)
@@ -380,10 +447,51 @@ int sctp_opt_info(int sd, sctp_assoc_t id, int opt, void *arg,
  * second socketpair and its own pump registration, and no caller in the
  * target set uses it. Refuse plainly instead of returning a broken fd.
  */
+/*
+ * sctp_peeloff turns one association of a one-to-many socket into its own
+ * one-to-one descriptor. usrsctp_peeloff creates the new usrsctp socket the
+ * same way accept() does, so it inherits the receive callback, and the
+ * adoption path written for accept() gives it its own descriptor pair,
+ * ulp_info, encapsulation setting and catch-up read. OCUDU's SCTP server
+ * peels every new association off its listener.
+ */
 int sctp_peeloff(int sd, sctp_assoc_t id)
 {
-	(void)sd;
-	(void)id;
-	errno = EOPNOTSUPP;
-	return -1;
+	struct lsc_conn *c = lsc_lookup(sd);
+	struct socket   *ns;
+	struct lsc_conn *nc;
+
+	if (c == NULL) {
+		errno = ENOTSOCK;
+		return -1;
+	}
+	if (c->type != SOCK_SEQPACKET) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+
+	ns = usrsctp_peeloff(c->us, id);
+	if (ns == NULL)
+		return -1;
+
+	/*
+	 * The new socket inherits the listener's blocking mode. Adoption
+	 * drains whatever the peer already sent with usrsctp_recvv, which
+	 * on a blocking socket waits for a message that may never come; the
+	 * application reads from its own descriptor pair anyway, so the
+	 * backend socket can be non-blocking, as accepted sockets are.
+	 */
+	usrsctp_set_non_blocking(ns, 1);
+
+	nc = lsc_adopt(c->domain, SOCK_STREAM, ns);
+	if (nc == NULL) {
+		int saved = errno;
+
+		usrsctp_close(ns);
+		errno = saved;
+		return -1;
+	}
+	lsc_log("peeloff assoc %u from app_fd=%d -> app_fd=%d", id, c->app_fd,
+	        nc->app_fd);
+	return nc->app_fd;
 }

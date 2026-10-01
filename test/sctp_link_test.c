@@ -67,7 +67,7 @@ int main(void)
 	      sctp_opt_info(fd, 0, SCTP_RTOINFO, buf, &len) == -1 &&
 	          errno == ENOTSOCK);
 	check("sctp_peeloff rejects",
-	      sctp_peeloff(fd, 0) == -1 && errno == EOPNOTSUPP);
+	      sctp_peeloff(fd, 0) == -1 && errno == ENOTSOCK);
 
 	/* The free helpers must tolerate NULL. */
 	sctp_freepaddrs(NULL);

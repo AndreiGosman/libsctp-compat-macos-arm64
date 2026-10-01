@@ -61,6 +61,20 @@ typedef uint32_t sctp_assoc_t;
 #define SCTP_STATUS                 0x00000100
 #define SCTP_GET_PEER_ADDR_INFO     0x00000101
 
+/* RFC 6458 per-event subscription (section 6.2.2). usrsctp numbers it 0x1e;
+ * Linux numbers it 127. The value here is usrsctp's and passes straight
+ * through to usrsctp_setsockopt. See SCTP_DATA_IO_EVENT below for the one
+ * se_type the shim answers itself. */
+#define SCTP_EVENT                  0x0000001e
+#define SCTP_RECVRCVINFO            0x0000001f
+#define SCTP_RECVNXTINFO            0x00000020
+
+/* Association id selectors for options and for sctp_event.se_assoc_id.
+ * Same values on Linux and usrsctp. */
+#define SCTP_FUTURE_ASSOC           0
+#define SCTP_CURRENT_ASSOC          1
+#define SCTP_ALL_ASSOC              2
+
 /* ------------------------------------------------------------------ */
 /* sinfo_flags / snd_flags                                             */
 /* ------------------------------------------------------------------ */
@@ -95,25 +109,46 @@ typedef uint32_t sctp_assoc_t;
 
 /* sn_type: the notification type in sctp_tlv.sn_type */
 enum sctp_sn_type {
-	SCTP_ASSOC_CHANGE           = 0x0001,
-	SCTP_PEER_ADDR_CHANGE       = 0x0002,
-	SCTP_REMOTE_ERROR           = 0x0003,
-	SCTP_SEND_FAILED            = 0x0004,
-	SCTP_SHUTDOWN_EVENT         = 0x0005,
-	SCTP_ADAPTATION_INDICATION  = 0x0006,
-	SCTP_PARTIAL_DELIVERY_EVENT = 0x0007,
-	SCTP_AUTHENTICATION_EVENT   = 0x0008,
-	SCTP_SENDER_DRY_EVENT       = 0x0009,
+	SCTP_ASSOC_CHANGE                = 0x0001,
+	SCTP_PEER_ADDR_CHANGE            = 0x0002,
+	SCTP_REMOTE_ERROR                = 0x0003,
+	SCTP_SEND_FAILED                 = 0x0004,
+	SCTP_SHUTDOWN_EVENT              = 0x0005,
+	SCTP_ADAPTATION_INDICATION       = 0x0006,
+	SCTP_PARTIAL_DELIVERY_EVENT      = 0x0007,
+	SCTP_AUTHENTICATION_EVENT        = 0x0008,
+	SCTP_STREAM_RESET_EVENT          = 0x0009,
+	SCTP_SENDER_DRY_EVENT            = 0x000a,
+	/* 0x000b is usrsctp's SCTP_NOTIFICATIONS_STOPPED_EVENT, a macro
+	 * below: lksctp has no such enumerator, and code that switches over
+	 * the full lksctp enum under -Wswitch must stay complete here too. */
+	SCTP_ASSOC_RESET_EVENT           = 0x000c,
+	SCTP_STREAM_CHANGE_EVENT         = 0x000d,
+	SCTP_SEND_FAILED_EVENT           = 0x000e,
+	/*
+	 * Linux-only se_type for sctp_event: it switches the sctp_sndrcvinfo
+	 * control message on. usrsctp has no such type and would answer
+	 * EINVAL. This library always delivers the receive information, so
+	 * setsockopt(SCTP_EVENT) with this type succeeds without reaching
+	 * usrsctp. The value is the Linux one; it collides with nothing above.
+	 */
+	SCTP_DATA_IO_EVENT               = 0x8000,
 };
-#define SCTP_ASSOC_CHANGE           SCTP_ASSOC_CHANGE
-#define SCTP_PEER_ADDR_CHANGE       SCTP_PEER_ADDR_CHANGE
-#define SCTP_REMOTE_ERROR           SCTP_REMOTE_ERROR
-#define SCTP_SEND_FAILED            SCTP_SEND_FAILED
-#define SCTP_SHUTDOWN_EVENT         SCTP_SHUTDOWN_EVENT
-#define SCTP_ADAPTATION_INDICATION  SCTP_ADAPTATION_INDICATION
-#define SCTP_PARTIAL_DELIVERY_EVENT SCTP_PARTIAL_DELIVERY_EVENT
-#define SCTP_AUTHENTICATION_EVENT   SCTP_AUTHENTICATION_EVENT
-#define SCTP_SENDER_DRY_EVENT       SCTP_SENDER_DRY_EVENT
+#define SCTP_ASSOC_CHANGE                SCTP_ASSOC_CHANGE
+#define SCTP_PEER_ADDR_CHANGE            SCTP_PEER_ADDR_CHANGE
+#define SCTP_REMOTE_ERROR                SCTP_REMOTE_ERROR
+#define SCTP_SEND_FAILED                 SCTP_SEND_FAILED
+#define SCTP_SHUTDOWN_EVENT              SCTP_SHUTDOWN_EVENT
+#define SCTP_ADAPTATION_INDICATION       SCTP_ADAPTATION_INDICATION
+#define SCTP_PARTIAL_DELIVERY_EVENT      SCTP_PARTIAL_DELIVERY_EVENT
+#define SCTP_AUTHENTICATION_EVENT        SCTP_AUTHENTICATION_EVENT
+#define SCTP_STREAM_RESET_EVENT          SCTP_STREAM_RESET_EVENT
+#define SCTP_SENDER_DRY_EVENT            SCTP_SENDER_DRY_EVENT
+#define SCTP_NOTIFICATIONS_STOPPED_EVENT 0x000b
+#define SCTP_ASSOC_RESET_EVENT           SCTP_ASSOC_RESET_EVENT
+#define SCTP_STREAM_CHANGE_EVENT         SCTP_STREAM_CHANGE_EVENT
+#define SCTP_SEND_FAILED_EVENT           SCTP_SEND_FAILED_EVENT
+#define SCTP_DATA_IO_EVENT               SCTP_DATA_IO_EVENT
 
 /* sac_state: sctp_assoc_change.sac_state */
 enum sctp_sac_state {
@@ -261,6 +296,44 @@ struct sctp_event_subscribe {
 	uint8_t sctp_stream_reset_event;
 };
 
+/* RFC 6458 section 6.2.2, SCTP_EVENT. Same layout on Linux and usrsctp. */
+struct sctp_event {
+	sctp_assoc_t se_assoc_id;
+	uint16_t     se_type;
+	uint8_t      se_on;
+};
+
+/* RFC 6458 section 5.3.4 to 5.3.6. Same layout on Linux and usrsctp. The
+ * library's sendmsg() understands SCTP_SNDINFO control messages carrying
+ * sctp_sndinfo; the receive side hands back SCTP_SNDRCV with
+ * sctp_sndrcvinfo, see the WARNING above the cmsg types. */
+struct sctp_sndinfo {
+	uint16_t     snd_sid;
+	uint16_t     snd_flags;
+	uint32_t     snd_ppid;
+	uint32_t     snd_context;
+	sctp_assoc_t snd_assoc_id;
+};
+
+struct sctp_rcvinfo {
+	uint16_t     rcv_sid;
+	uint16_t     rcv_ssn;
+	uint16_t     rcv_flags;
+	uint32_t     rcv_ppid;
+	uint32_t     rcv_tsn;
+	uint32_t     rcv_cumtsn;
+	uint32_t     rcv_context;
+	sctp_assoc_t rcv_assoc_id;
+};
+
+struct sctp_nxtinfo {
+	uint16_t     nxt_sid;
+	uint16_t     nxt_flags;
+	uint32_t     nxt_ppid;
+	uint32_t     nxt_length;
+	sctp_assoc_t nxt_assoc_id;
+};
+
 struct sctp_initmsg {
 	uint16_t sinit_num_ostreams;
 	uint16_t sinit_max_instreams;
@@ -283,6 +356,29 @@ struct sctp_assocparams {
 	uint16_t     sasoc_asocmaxrxt;
 	uint16_t     sasoc_number_peer_destinations;
 };
+
+/* SCTP_PEER_ADDR_PARAMS. usrsctp layout (address first, where lksctp puts
+ * the association id first), lksctp member names. */
+struct sctp_paddrparams {
+	struct sockaddr_storage spp_address;
+	sctp_assoc_t            spp_assoc_id;
+	uint32_t                spp_hbinterval;
+	uint32_t                spp_pathmtu;
+	uint32_t                spp_flags;
+	uint32_t                spp_ipv6_flowlabel;
+	uint16_t                spp_pathmaxrxt;
+	uint8_t                 spp_dscp;
+};
+
+/* spp_flags, usrsctp values. */
+#define SPP_HB_ENABLE       0x00000001
+#define SPP_HB_DISABLE      0x00000002
+#define SPP_HB_DEMAND       0x00000004
+#define SPP_PMTUD_ENABLE    0x00000008
+#define SPP_PMTUD_DISABLE   0x00000010
+#define SPP_HB_TIME_IS_ZERO 0x00000080
+#define SPP_IPV6_FLOWLABEL  0x00000100
+#define SPP_DSCP            0x00000200
 
 /* NOTE: the member order below follows usrsctp, not lksctp. The shim hands
  * these structures to usrsctp byte for byte, so the layout must be the one
@@ -412,21 +508,62 @@ struct sctp_sender_dry_event {
 	sctp_assoc_t sender_dry_assoc_id;
 };
 
+/* RFC 6525 and RFC 6458 section 6.1.9 to 6.1.11, usrsctp layouts. */
+struct sctp_stream_reset_event {
+	uint16_t     strreset_type;
+	uint16_t     strreset_flags;
+	uint32_t     strreset_length;
+	sctp_assoc_t strreset_assoc_id;
+	uint16_t     strreset_stream_list[];
+};
+
+struct sctp_assoc_reset_event {
+	uint16_t     assocreset_type;
+	uint16_t     assocreset_flags;
+	uint32_t     assocreset_length;
+	sctp_assoc_t assocreset_assoc_id;
+	uint32_t     assocreset_local_tsn;
+	uint32_t     assocreset_remote_tsn;
+};
+
+struct sctp_stream_change_event {
+	uint16_t     strchange_type;
+	uint16_t     strchange_flags;
+	uint32_t     strchange_length;
+	sctp_assoc_t strchange_assoc_id;
+	uint16_t     strchange_instrms;
+	uint16_t     strchange_outstrms;
+};
+
+struct sctp_send_failed_event {
+	uint16_t            ssfe_type;
+	uint16_t            ssfe_flags;
+	uint32_t            ssfe_length;
+	uint32_t            ssfe_error;
+	struct sctp_sndinfo ssfe_info;
+	sctp_assoc_t        ssfe_assoc_id;
+	uint8_t             ssfe_data[];
+};
+
 union sctp_notification {
 	struct sctp_tlv {
 		uint16_t sn_type;
 		uint16_t sn_flags;
 		uint32_t sn_length;
 	} sn_header;
-	struct sctp_assoc_change     sn_assoc_change;
-	struct sctp_paddr_change     sn_paddr_change;
-	struct sctp_remote_error     sn_remote_error;
-	struct sctp_send_failed      sn_send_failed;
-	struct sctp_shutdown_event   sn_shutdown_event;
-	struct sctp_adaptation_event sn_adaptation_event;
-	struct sctp_pdapi_event      sn_pdapi_event;
-	struct sctp_authkey_event    sn_auth_event;
-	struct sctp_sender_dry_event sn_sender_dry_event;
+	struct sctp_assoc_change        sn_assoc_change;
+	struct sctp_paddr_change        sn_paddr_change;
+	struct sctp_remote_error        sn_remote_error;
+	struct sctp_send_failed         sn_send_failed;
+	struct sctp_shutdown_event      sn_shutdown_event;
+	struct sctp_adaptation_event    sn_adaptation_event;
+	struct sctp_pdapi_event         sn_pdapi_event;
+	struct sctp_authkey_event       sn_auth_event;
+	struct sctp_sender_dry_event    sn_sender_dry_event;
+	struct sctp_send_failed_event   sn_send_failed_event;
+	struct sctp_stream_reset_event  sn_strreset_event;
+	struct sctp_assoc_reset_event   sn_assocreset_event;
+	struct sctp_stream_change_event sn_strchange_event;
 };
 
 /* ------------------------------------------------------------------ */

@@ -217,6 +217,19 @@ int shutdown(int fd, int how)
 	if (c == NULL)
 		return lsc_real_shutdown(fd, how);
 
+	/*
+	 * Linux SCTP acts on the write half only: shutdown(SHUT_RDWR) sends
+	 * SHUTDOWN and leaves the socket readable, so the caller still
+	 * receives the SCTP_SHUTDOWN_COMP notification that tells it the
+	 * association is gone. usrsctp honours SHUT_RD as well and cancels
+	 * receive, which silently drops that notification and leaves a
+	 * Linux-style caller waiting for it. Map to the Linux behaviour.
+	 */
+	if (how == SHUT_RDWR)
+		how = SHUT_WR;
+	else if (how == SHUT_RD)
+		return 0;
+
 	return usrsctp_shutdown(c->us, how);
 }
 
@@ -232,6 +245,33 @@ static int lsc_map_sctp_opt(int name)
 	if (name == LINUX_SCTP_EVENTS)
 		return USRSCTP_SCTP_EVENTS;
 	return name;
+}
+
+/*
+ * RFC 6458 subscribes per event type through SCTP_EVENT and a struct
+ * sctp_event. The option number and the structure are usrsctp's already
+ * (netinet/sctp.h takes usrsctp's values), so the call passes through,
+ * with one exception. Linux has an extra se_type, SCTP_DATA_IO_EVENT,
+ * which switches the sctp_sndrcvinfo control message on. usrsctp knows no
+ * such type and answers EINVAL, which a caller treats as a failed socket
+ * setup. The receive information is delivered unconditionally by this
+ * library, so that subscription is already satisfied: answer success.
+ */
+#define LSC_SCTP_EVENT          0x0000001e
+#define LSC_SCTP_DATA_IO_EVENT  0x8000
+
+struct lsc_sctp_event {
+	uint32_t se_assoc_id;
+	uint16_t se_type;
+	uint8_t  se_on;
+};
+
+static int lsc_is_data_io_subscription(int name, const void *val, socklen_t len)
+{
+	const struct lsc_sctp_event *ev = val;
+
+	return name == LSC_SCTP_EVENT && val != NULL &&
+	       len >= sizeof(*ev) && ev->se_type == LSC_SCTP_DATA_IO_EVENT;
 }
 
 int setsockopt(int fd, int level, int name, const void *val, socklen_t len)
@@ -281,8 +321,25 @@ int setsockopt(int fd, int level, int name, const void *val, socklen_t len)
 		}
 	}
 
-	if (level == IPPROTO_SCTP)
+	if (level == IPPROTO_SCTP) {
+		if (lsc_is_data_io_subscription(name, val, len))
+			return 0;
 		name = lsc_map_sctp_opt(name);
+	}
+
+	/*
+	 * usrsctp_setsockopt rejects every level but SOL_SOCKET and
+	 * IPPROTO_SCTP with ENOPROTOOPT. An IPv6 socket in usrsctp is dual
+	 * stack unless the endpoint was created v6-only, which this library
+	 * never does, so a request to clear IPV6_V6ONLY describes the state
+	 * the socket is already in. Setting it has no backend to go to.
+	 */
+	if (level == IPPROTO_IPV6 && name == IPV6_V6ONLY) {
+		if (val != NULL && len >= sizeof(int) && *(const int *)val == 0)
+			return 0;
+		errno = EOPNOTSUPP;
+		return -1;
+	}
 
 	return usrsctp_setsockopt(c->us, level, name, val, len);
 }
@@ -354,7 +411,30 @@ int getsockname(int fd, struct sockaddr *addr, socklen_t *len)
 	if (c == NULL)
 		return lsc_real_getsockname(fd, addr, len);
 
-	n  = usrsctp_getladdrs(c->us, 0, &addrs);
+	n = usrsctp_getladdrs(c->us, 0, &addrs);
+	if (n <= 0) {
+		/*
+		 * Linux answers getsockname() on an unbound SCTP socket with
+		 * the wildcard address of the socket's family and port 0.
+		 * usrsctp has no local address to report yet; synthesise the
+		 * same answer instead of failing with ENOTCONN.
+		 */
+		struct sockaddr_storage ss;
+		socklen_t               want;
+
+		memset(&ss, 0, sizeof(ss));
+		ss.ss_family = (sa_family_t)c->domain;
+		want = c->domain == AF_INET6 ? sizeof(struct sockaddr_in6)
+		                             : sizeof(struct sockaddr_in);
+		ss.ss_len = (uint8_t)want;
+		if (*len < want)
+			want = *len;
+		memcpy(addr, &ss, want);
+		*len = want;
+		if (addrs != NULL)
+			usrsctp_freeladdrs(addrs);
+		return 0;
+	}
 	rc = lsc_first_addr(addrs, n, addr, len);
 	if (addrs != NULL)
 		usrsctp_freeladdrs(addrs);

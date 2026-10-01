@@ -123,21 +123,26 @@ and the backend.
 | lksctp | backend |
 | --- | --- |
 | `socket(…, IPPROTO_SCTP)` | `usrsctp_socket()` plus a socketpair |
-| `bind`, `listen`, `connect`, `shutdown` | `usrsctp_bind`, `_listen`, `_connect`, `_shutdown` |
+| `bind`, `listen`, `connect` | `usrsctp_bind`, `_listen`, `_connect` |
+| `shutdown` | `usrsctp_shutdown` on the write half only: Linux SCTP ignores `SHUT_RD`, so `SHUT_RDWR` becomes `SHUT_WR` and the caller still receives `SCTP_SHUTDOWN_COMP`; usrsctp would otherwise cancel receive and drop it (since v0.4.0) |
 | `setsockopt`, `getsockopt` at `IPPROTO_SCTP` | `usrsctp_setsockopt`, `usrsctp_getsockopt` |
 | `setsockopt` at `SOL_SOCKET` for timeouts and buffers | the socketpair descriptor |
 | `setsockopt(SOL_SOCKET, SO_NOSIGPIPE)` | accepted as a no-op, usrsctp never raises SIGPIPE (since v0.3.2) |
 | `getsockopt(IPPROTO_SCTP, SCTP_STATUS)` | `usrsctp_getsockopt`; the RFC 6458 `struct sctp_status` has the same layout in lksctp and usrsctp, so it passes through |
-| `getsockname`, `getpeername` | first entry of `usrsctp_getladdrs`, `_getpaddrs` |
+| `setsockopt(IPPROTO_SCTP, SCTP_EVENT)` with `struct sctp_event` | `usrsctp_setsockopt`, same option number and layout; the Linux-only `se_type` `SCTP_DATA_IO_EVENT` is answered with success by the library, since the receive information is always delivered (since v0.4.0) |
+| `setsockopt(IPPROTO_SCTP, SCTP_PEER_ADDR_PARAMS)` with `struct sctp_paddrparams` | `usrsctp_setsockopt`; the header declares the usrsctp layout (address first) with the lksctp member names (since v0.4.0) |
+| `getsockname`, `getpeername` | first entry of `usrsctp_getladdrs`, `_getpaddrs`; an unbound socket answers the wildcard address with port 0, as on Linux, instead of ENOTCONN (since v0.4.0) |
 | `sctp_sendmsg`, `sctp_send` | `usrsctp_sendv` with `SCTP_SENDV_SNDINFO` |
 | `sctp_recvmsg` | `recvmsg` on the socketpair, fed by the receive callback |
-| `sendmsg` with an SCTP control message | the `sctp_sendmsg` path, after gathering the iovec |
+| `sendmsg` with an SCTP control message | the `sctp_sendmsg` path, after gathering the iovec; a zero-length send carrying `SCTP_EOF` or `SCTP_ABORT` is accepted, as on Linux (since v0.4.0) |
 | `recvmsg` | the socketpair, with an `SCTP_SNDRCV` control message built from the frame |
 | `accept` | pops a connection the listen upcall already accepted and adopted; never waits |
 | `sctp_bindx` | `usrsctp_bindx`, one address per call |
-| `sctp_connectx`, `sctp_getpaddrs`, `sctp_getladdrs`, `sctp_opt_info` | the matching `usrsctp_*` call |
+| `sctp_connectx` | `usrsctp_connectx`, after normalising `sa_len` on every entry of the packed list as `sctp_bindx` does (since v0.4.0; before, a Linux-built address list failed with EINVAL) |
+| `sctp_getpaddrs`, `sctp_getladdrs`, `sctp_opt_info` | the matching `usrsctp_*` call |
 | `sctp_freepaddrs`, `sctp_freeladdrs` | the matching call, with a NULL guard |
-| `sctp_peeloff` | not implemented, returns `EOPNOTSUPP` |
+| `sctp_peeloff` | `usrsctp_peeloff`, then the same adoption as `accept()`: own descriptor pair, ulp_info, encapsulation port, catch-up read (since v0.4.0; before, `EOPNOTSUPP`) |
+| `setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, 0)` | accepted as a no-op, a usrsctp IPv6 socket is dual stack already; setting it to 1 answers `EOPNOTSUPP` (since v0.4.0) |
 
 ## Differences from Linux that callers can see
 
@@ -174,6 +179,19 @@ Linux numbers reads every notification wrongly. A few members of those enums
 (`SCTP_PF`, `SCTP_UNKNOWN`, `SCTP_EMPTY` and the whole `sctp_sn_error` set)
 exist so that code enumerating the full lksctp set still compiles. usrsctp
 never reports them.
+
+Until v0.3.2 `enum sctp_sn_type` stopped at `SCTP_SENDER_DRY_EVENT` and gave it
+the value 0x0009, which is usrsctp's `SCTP_STREAM_RESET_EVENT`; a sender-dry
+notification (0x000a) would have compared equal to nothing. v0.4.0 renumbers
+the enum to usrsctp's list, `SCTP_STREAM_RESET_EVENT` 0x0009 through
+`SCTP_SEND_FAILED_EVENT` 0x000e (usrsctp's `SCTP_NOTIFICATIONS_STOPPED_EVENT`
+0x000b is a macro outside the enum, since lksctp has no such enumerator and a
+switch over the lksctp set must stay complete under -Wswitch), and adds the
+matching `sctp_stream_reset_event`,
+`sctp_assoc_reset_event`, `sctp_stream_change_event` and
+`sctp_send_failed_event` structures to `union sctp_notification`. `SCTP_DATA_IO_EVENT`
+keeps the Linux value 0x8000, which collides with no usrsctp type; it is only
+ever seen by `setsockopt(SCTP_EVENT)`, never in a notification.
 
 usrsctp is built with `HAVE_SA_LEN` and `HAVE_SIN_LEN`, so it reads the
 `sin_len` field that Linux sockaddrs do not have. Every address the caller
@@ -246,6 +264,16 @@ unaddressed one-to-many send is what RFC 6458 section 3.1.3 calls for. Both are
 documented above as differences a caller can see, which is where they belong.
 
 ## Status
+
+v0.4.0 adds the RFC 6458 per-event subscription that OCUDU (the srsRAN Project
+successor) uses for NGAP, F1-C and E1: `SCTP_EVENT` with `struct sctp_event`,
+`SCTP_FUTURE_ASSOC`, `struct sctp_sndinfo` for `SCTP_SNDINFO` control messages,
+`struct sctp_paddrparams` for `SCTP_PEER_ADDR_PARAMS`, `struct sctp_rcvinfo`
+and `struct sctp_nxtinfo`. A two process exchange in that shape (one-to-many
+sockets on both ends, subscriptions through `SCTP_EVENT`, a request, a reply by
+association id, then a shutdown started with a zero-length `sendmsg` carrying
+`SCTP_SNDINFO` with `SCTP_EOF`) delivers `SCTP_COMM_UP` on both ends, the data,
+`SCTP_SHUTDOWN_EVENT` on the listener and `SCTP_SHUTDOWN_COMP` on both.
 
 The loopback test establishes a real SCTP association between two sockets in
 one process, sends a payload, and reads it back through `poll()` and
