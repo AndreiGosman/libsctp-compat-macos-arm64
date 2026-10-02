@@ -197,9 +197,13 @@ usrsctp is built with `HAVE_SA_LEN` and `HAVE_SIN_LEN`, so it reads the
 `sin_len` field that Linux sockaddrs do not have. Every address the caller
 passes is normalised before it reaches the backend.
 
-`sctp_peeloff` is refused rather than half-implemented. Splitting one
-association off a one-to-many socket would need a second socketpair and its own
-pump registration, and no target project calls it.
+`sctp_peeloff` creates a socket of its own for one association of a
+one-to-many socket, through `usrsctp_peeloff` and the same adoption `accept()`
+uses: a descriptor pair, ulp_info, the encapsulation port and a catch-up read of
+anything usrsctp already queued. The new socket is set non-blocking before the
+adoption, or the catch-up read never returns. Until v0.3.2 the call answered
+`EOPNOTSUPP`, because no target project used it; OCUDU's SCTP server peels
+every new association off its listener.
 
 The `timetolive` argument of `sctp_sendmsg` is not forwarded. usrsctp carries
 partial reliability in a separate `sctp_prinfo` block. A non-zero value is
@@ -240,8 +244,16 @@ does not share. See the macOS ARM64 port of libosmo-netif for the detail.
 libosmo-abis 2.2.0 builds with no patches at all and passes all 45 of its
 tests.
 
-osmo-bts and the Osmocom core network are the next targets and are not yet
-tested.
+The Osmocom core network daemons (osmo-stp, osmo-hlr, osmo-msc, osmo-bsc,
+osmo-hnbgw, osmo-sgsn) have since been built and run over this library on
+macOS ARM64, each with its own kit under the same GitHub account.
+
+OCUDU 26.10 (the srsRAN Project successor) builds its gateway library and
+tests against this header on macOS, and its gNB completed NG Setup, a 5G SA
+registration and a PDU session against an Open5GS AMF through this library, in
+the one-to-one `sctp_connectx` plus `SCTP_EVENT` shape. v0.4.0 is the version
+that work needed; the kit is
+[ocudu-macos-arm64](https://github.com/AndreiGosman/ocudu-macos-arm64).
 
 ## Loopback aliases
 
