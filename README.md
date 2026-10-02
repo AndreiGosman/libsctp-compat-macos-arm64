@@ -79,11 +79,11 @@ what srsRAN and Osmocom both do, keeps working unchanged.
 ## Build
 
 ```
-source ~/sdr-lab/env.sh
+export PREFIX="$HOME/local"   # or any install prefix
 scripts/install_usrsctp.sh          # builds and installs the backend
 cd src/libsctp-compat
 mkdir build && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/sdr-lab/local -DCMAKE_BUILD_TYPE=Release
+cmake .. -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_BUILD_TYPE=Release
 make -j$(sysctl -n hw.ncpu)
 ctest --output-on-failure
 make install
@@ -355,7 +355,7 @@ After upgrading to a version that adds interposed calls, rebuild every
 consumer that links this library and check what the bindings became:
 
 ```bash
-nm -mu $HOME/sdr-lab/local/lib/libosmonetif.dylib | \
+nm -mu "$PREFIX/lib/libosmonetif.dylib" | \
     grep -E "_accept|_sendmsg|_recvmsg|_socket"
 ```
 
@@ -377,5 +377,5 @@ LGPL-2.1-or-later. usrsctp itself is BSD-3-Clause.
 
 ## Credits
 
-Port by Andrei Gosman, developed with Claude Code CLI (Anthropic) assisting
+Port by Andrei Gosman
 on pattern analysis, debugging and iteration.
