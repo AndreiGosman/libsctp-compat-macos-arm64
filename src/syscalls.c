@@ -321,6 +321,22 @@ int setsockopt(int fd, int level, int name, const void *val, socklen_t len)
 		}
 	}
 
+	/*
+	 * lksctp copies as much of a struct sctp_event_subscribe as the
+	 * caller passes and leaves the rest clear, so an application built
+	 * against an older struct, or one that spells the length out (OAI
+	 * passes 8), keeps working. usrsctp requires the full structure and
+	 * answers EINVAL otherwise. Widen a short subscription here.
+	 */
+	struct sctp_event_subscribe events_full;
+	if (level == IPPROTO_SCTP && name == LINUX_SCTP_EVENTS && val != NULL &&
+	    len < sizeof(events_full)) {
+		memset(&events_full, 0, sizeof(events_full));
+		memcpy(&events_full, val, len);
+		val = &events_full;
+		len = sizeof(events_full);
+	}
+
 	if (level == IPPROTO_SCTP) {
 		if (lsc_is_data_io_subscription(name, val, len))
 			return 0;

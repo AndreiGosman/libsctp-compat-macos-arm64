@@ -3,6 +3,19 @@
 Versions are git tags. Each entry lists what changed for a caller and the
 symptom that made the change necessary.
 
+## v0.4.1, 2026-10-02
+
+- `setsockopt(IPPROTO_SCTP, SCTP_EVENTS)` with a length shorter than
+  `struct sctp_event_subscribe` is widened with zeros to the full structure
+  before it reaches usrsctp. lksctp copies what it is given and leaves the
+  rest clear, so an application that spells the length out keeps working on
+  Linux; usrsctp requires the full structure and answered EINVAL. OAI passes 8
+  (`openair3/SCTP/sctp_eNB_task.c`) on every NGAP, F1 and nFAPI socket and
+  asserts on the failure, so the gNB could not open a single SCTP socket.
+  New test `sctp_events_shortlen_test`: two processes, the subscription with
+  length 8 on both ends, the association and the `SCTP_COMM_UP` notification
+  delivered to both. `SCTP_EVENT` (singular, RFC 6458) is unchanged.
+
 ## v0.4.0, 2026-10-01
 
 The RFC 6458 per-event subscription and six Linux semantics that the OCUDU

@@ -129,6 +129,7 @@ and the backend.
 | `setsockopt` at `SOL_SOCKET` for timeouts and buffers | the socketpair descriptor |
 | `setsockopt(SOL_SOCKET, SO_NOSIGPIPE)` | accepted as a no-op, usrsctp never raises SIGPIPE (since v0.3.2) |
 | `getsockopt(IPPROTO_SCTP, SCTP_STATUS)` | `usrsctp_getsockopt`; the RFC 6458 `struct sctp_status` has the same layout in lksctp and usrsctp, so it passes through |
+| `setsockopt(IPPROTO_SCTP, SCTP_EVENTS)` with a length shorter than `struct sctp_event_subscribe` | widened with zeros to the full structure, as lksctp reads it; usrsctp would answer EINVAL (since v0.4.1; OAI passes 8) |
 | `setsockopt(IPPROTO_SCTP, SCTP_EVENT)` with `struct sctp_event` | `usrsctp_setsockopt`, same option number and layout; the Linux-only `se_type` `SCTP_DATA_IO_EVENT` is answered with success by the library, since the receive information is always delivered (since v0.4.0) |
 | `setsockopt(IPPROTO_SCTP, SCTP_PEER_ADDR_PARAMS)` with `struct sctp_paddrparams` | `usrsctp_setsockopt`; the header declares the usrsctp layout (address first) with the lksctp member names (since v0.4.0) |
 | `getsockname`, `getpeername` | first entry of `usrsctp_getladdrs`, `_getpaddrs`; an unbound socket answers the wildcard address with port 0, as on Linux, instead of ENOTCONN (since v0.4.0) |

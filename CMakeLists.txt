@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 cmake_minimum_required(VERSION 3.16)
-project(libsctp-compat VERSION 0.4.0 LANGUAGES C CXX)
+project(libsctp-compat VERSION 0.4.1 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -69,6 +69,13 @@ if(sctp_build_tests)
   add_executable(sctp_twoproc_test test/sctp_twoproc_test.c)
   target_link_libraries(sctp_twoproc_test PRIVATE sctp)
   add_test(NAME sctp_twoproc_test COMMAND sctp_twoproc_test)
+
+  # The same two processes, subscribing through SCTP_EVENTS with a length
+  # shorter than the structure, as OAI does (8 bytes). Checks that the
+  # association comes up and that the notifications arrive on both ends.
+  add_executable(sctp_events_shortlen_test test/sctp_events_shortlen_test.c)
+  target_link_libraries(sctp_events_shortlen_test PRIVATE sctp)
+  add_test(NAME sctp_events_shortlen_test COMMAND sctp_events_shortlen_test)
 
   # The header is consumed from C++ by both srsRAN and Osmocom.
   add_executable(sctp_interpose_test test/sctp_interpose_test.c)
